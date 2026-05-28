@@ -2,27 +2,16 @@
 Interactive multi-label text classification widget for Jupyter notebooks.
 
 Usage:
+    from IPython.display import display
     from sentence_transformers import SentenceTransformer
     from labeler import LabelingWidget
 
     model = SentenceTransformer("all-MiniLM-L6-v2")
-    labels = {
-        "sentiment": {
-            "positive": "expresses approval, happiness, or satisfaction",
-            "negative": "expresses disapproval, anger, or frustration",
-            "neutral":  "factual, no clear emotional valence",
-        },
-        "topic": {
-            "pricing":  "mentions cost, price, fees, or value for money",
-            "support":  "mentions customer service, help, or response time",
-            "quality":  "mentions product quality, defects, or durability",
-        },
-    }
 
     widget = LabelingWidget(
-        model,
-        labels,
-        df,
+        embed_model=model,
+        label_dict=labels,
+        df=df,
         save_path="labeled.parquet",
         text_column="text",
     )
@@ -201,6 +190,15 @@ class LabelingWidget(widgets.VBox):
         self.categories_box = widgets.VBox()
         self.status = widgets.HTML()
 
+        self.filter_input = widgets.Text(
+            value="",
+            placeholder="Filter labels by category, name, or description...",
+            description="Filter:",
+            layout=widgets.Layout(width="100%"),
+        )
+
+        self.filter_input.observe(self._on_filter_change, names="value")
+
         btn_layout = widgets.Layout(width="90px")
 
         self.prev_btn = widgets.Button(
@@ -266,11 +264,24 @@ class LabelingWidget(widgets.VBox):
             children=[
                 self.progress_label,
                 self.text_html,
+                self.filter_input,
                 self.categories_box,
                 nav,
                 self.status,
             ]
         )
+
+    def _on_filter_change(self, change) -> None:
+        self._render()
+
+    def _label_matches_filter(self, cat: str, lab: str, desc: str, query: str) -> bool:
+        if not query:
+            return True
+
+        haystack = f"{cat} {lab} {desc}".lower()
+        terms = query.lower().split()
+
+        return all(term in haystack for term in terms)
 
     def _render(self) -> None:
         n = len(self.df)
@@ -303,7 +314,10 @@ class LabelingWidget(widgets.VBox):
             self.df.iat[i, self.df.columns.get_loc(self.labels_column)]
         )
 
+        query = self.filter_input.value.strip()
+
         category_widgets = []
+        total_visible = 0
 
         for cat, idxs in self.cat_to_flat_idx.items():
             sorted_idxs = sorted(idxs, key=lambda k: -float(sims[k]))
@@ -311,6 +325,9 @@ class LabelingWidget(widgets.VBox):
 
             for rank, k in enumerate(sorted_idxs):
                 _, lab, desc = self.flat_labels[k]
+
+                if not self._label_matches_filter(cat, lab, desc, query):
+                    continue
 
                 key = f"{cat}{LABEL_SEP}{lab}"
                 selected = key in current_labels
@@ -330,26 +347,47 @@ class LabelingWidget(widgets.VBox):
 
                 buttons.append(btn)
 
-            category_widgets.append(
-                widgets.VBox(
-                    [
-                        widgets.HTML(
-                            f"<div style='margin-top:8px;font-weight:600;color:#333'>"
-                            f"{html.escape(cat)}</div>"
-                        ),
-                        widgets.Box(
-                            buttons,
-                            layout=widgets.Layout(
-                                display="flex",
-                                flex_flow="row wrap",
+            if buttons:
+                total_visible += len(buttons)
+
+                category_widgets.append(
+                    widgets.VBox(
+                        [
+                            widgets.HTML(
+                                f"<div style='margin-top:8px;font-weight:600;color:#333'>"
+                                f"{html.escape(cat)}</div>"
                             ),
-                        ),
-                    ]
+                            widgets.Box(
+                                buttons,
+                                layout=widgets.Layout(
+                                    display="flex",
+                                    flex_flow="row wrap",
+                                ),
+                            ),
+                        ]
+                    )
+                )
+
+        if not category_widgets:
+            category_widgets.append(
+                widgets.HTML(
+                    "<div style='margin:8px 0; color:#888;'>"
+                    "No labels match the current filter."
+                    "</div>"
                 )
             )
 
         self.categories_box.children = category_widgets
-        self.status.value = ""
+
+        if query:
+            self.status.value = (
+                f"<span style='color:#666'>"
+                f"showing {total_visible} label option(s) matching "
+                f"<code>{html.escape(query)}</code>"
+                f"</span>"
+            )
+        else:
+            self.status.value = ""
 
     @staticmethod
     def _style_for(selected: bool, is_top: bool) -> str:
