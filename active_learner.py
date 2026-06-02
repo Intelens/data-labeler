@@ -1,39 +1,39 @@
-"""Active-learning fine-tuning widget for sentence-transformer text classifiers.
+"""Active-learning widget for multi-label text classification.
 
-Subclasses ``LabelingWidget``: keeps all the labeling UI, adds a training
-panel, an uncertainty-based queue for the next-unlabeled button, and an
-evaluation plot.
+This is the **only reusable .py file** in the workflow. Feature engineering
+(embeddings, how text+label vectors are combined, PCA, …) and the model
+(e.g. a plain XGBoost binary classifier) are defined in the *notebook* — see
+``xgboost_feature_engineering.ipynb`` — and handed to this widget. The widget
+just orchestrates the labeling loop, retraining, evaluation and PSO.
 
-Takes a :class:`mlflow_model.SentenceTransformerClassifier` as input; all
-training, prediction, and evaluation are delegated to that model.
+The widget is model-agnostic. It only requires the ``model`` object to expose:
 
-Updated evaluation behavior:
-- Shows one binary confusion matrix per category.
-- Shows one binary confusion matrix per label.
-- Every individual 2x2 matrix sums to n_eval.
+    model.fit(text_embeddings, truth, *, eval_text_embeddings=None,
+              eval_truth=None, epochs=1, progress_callback=None,
+              log_to_mlflow=False, **hp) -> dict
+    model.predict_scores(text_embeddings) -> ndarray  # (n_rows, n_labels)
 
-Usage:
-    from IPython.display import display
-    from mlflow_model import SentenceTransformerClassifier
-    from active_learning import ActiveLearner
+Optional, used when present: ``threshold`` (float attr),
+``train_hyperparams()``, ``set_label_embeddings()``, ``snapshot_state()`` /
+``restore_state()``, and ``save_pretrained()``.
 
-    clf = SentenceTransformerClassifier(
-        label_dict=labels,
-        model_name_or_path="all-MiniLM-L6-v2",
-        threshold=0.45,
-    )
+Data is passed as two :class:`EmbeddedDataset` objects (the notebook builds
+them after computing embeddings): the training ``pool`` (labeled + unlabeled)
+and a fully-labeled ``eval`` set. Embeddings are computed once up front (frozen
+encoder), so the widget never re-encodes the pool.
+
+Usage (in the notebook):
+    data      = EmbeddedDataset(pool_df, pool_text_embs, label_embs, label_dict)
+    eval_data = EmbeddedDataset(test_df, test_text_embs, label_embs, label_dict)
+    model     = <your notebook-defined classifier>
 
     w = ActiveLearner(
-        model=clf,
-        labeled_test_path="labeled_demo.csv",
-        labeled_train_path="labeled_train_al.csv",
-        unlabeled_train_path="unlabeled_train.csv",
-        retrain_every=10,
-        epochs=1,
-        batch_size=16,
-        query_strategy="margin",
+        data=data, eval_data=eval_data,
+        model=model, embedding_model=embedding_model,
+        retrain_every=10, query_strategy="margin",
+        labeled_save_path="labeled_train_al.csv",
     )
-    display(w)
+    w
 """
 
 from __future__ import annotations
@@ -41,15 +41,115 @@ from __future__ import annotations
 import html
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import ipywidgets as widgets
 import numpy as np
 import pandas as pd
 
 from labeler import LABEL_SEP, LabelingWidget
-from mlflow_model import SentenceTransformerClassifier
+
+
+def _coerce_label_list(x: Any) -> list[str]:
+    """Coerce a cell into ``list[str]`` (list / JSON string / scalar / NaN)."""
+    if isinstance(x, list):
+        return [str(v) for v in x]
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return []
+        if s.startswith("["):
+            try:
+                return [str(v) for v in json.loads(s)]
+            except Exception:
+                pass
+        return [s]
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return []
+    return []
+
+
+@dataclass
+class EmbeddedDataset:
+    """A DataFrame plus its precomputed embeddings, ready for the widget.
+
+    The notebook computes ``text_embeddings`` (one row per DataFrame row) and
+    ``label_embeddings`` (one row per ``cat::label``) and packages them here.
+    ``df`` is shared by reference so labels added in the UI flow straight into
+    :meth:`truth_matrix` / :meth:`labeled_indices`.
+    """
+
+    df: pd.DataFrame
+    text_embeddings: np.ndarray
+    label_embeddings: np.ndarray
+    label_dict: dict[str, dict[str, str]]
+    text_column: str = "text"
+    labels_column: str = "labels"
+
+    def __post_init__(self):
+        self.flat_labels = [
+            (cat, lab, desc)
+            for cat, labs in self.label_dict.items()
+            for lab, desc in labs.items()
+        ]
+        self.label_keys = [f"{c}{LABEL_SEP}{l}" for c, l, _ in self.flat_labels]
+        self.categories = list(self.label_dict.keys())
+        self.df = self.df.reset_index(drop=True)
+        if self.labels_column not in self.df.columns:
+            self.df[self.labels_column] = [[] for _ in range(len(self.df))]
+        else:
+            self.df[self.labels_column] = self.df[self.labels_column].apply(
+                _coerce_label_list
+            )
+
+    @property
+    def texts(self) -> list[str]:
+        return self.df[self.text_column].astype(str).tolist()
+
+    def truth_matrix(self) -> np.ndarray:
+        truth = np.zeros((len(self.df), len(self.label_keys)), dtype=bool)
+        key_to_idx = {k: i for i, k in enumerate(self.label_keys)}
+        for r, labs in enumerate(self.df[self.labels_column]):
+            for key in labs:
+                idx = key_to_idx.get(key)
+                if idx is not None:
+                    truth[r, idx] = True
+        return truth
+
+    def labeled_indices(self) -> list[int]:
+        return [i for i, labs in enumerate(self.df[self.labels_column]) if labs]
+
+    def labeled_subset(self) -> tuple[np.ndarray, np.ndarray]:
+        idxs = self.labeled_indices()
+        if not idxs:
+            return (
+                self.text_embeddings[:0],
+                np.zeros((0, len(self.label_keys)), dtype=bool),
+            )
+        idx = np.asarray(idxs, dtype=int)
+        return self.text_embeddings[idx], self.truth_matrix()[idx]
+
+
+def _save_labeled(df: pd.DataFrame, path: Path, labels_column: str) -> None:
+    """Persist only the labeled rows of ``df`` to ``path`` (csv/parquet/json)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    labeled = df[df[labels_column].apply(bool)].reset_index(drop=True)
+    ext = path.suffix.lower()
+    if ext == ".csv":
+        tmp = labeled.copy()
+        tmp[labels_column] = tmp[labels_column].apply(json.dumps)
+        tmp.to_csv(path, index=False)
+    elif ext == ".parquet":
+        labeled.to_parquet(path, index=False)
+    elif ext == ".json":
+        labeled.to_json(path, orient="records", indent=2)
+    elif ext in (".pkl", ".pickle"):
+        labeled.to_pickle(path)
+    else:
+        raise ValueError(f"unsupported save extension: {ext}")
 
 
 QueryStrategy = Literal["margin", "least_confidence", "random"]
@@ -58,71 +158,78 @@ QueryStrategy = Literal["margin", "least_confidence", "random"]
 class ActiveLearner(LabelingWidget):
     def __init__(
         self,
-        model: SentenceTransformerClassifier,
-        labeled_test_path: str | Path,
-        labeled_train_path: str | Path,
-        unlabeled_train_path: str | Path,
-        text_column: str = "text",
-        labels_column: str = "labels",
+        data: EmbeddedDataset,
+        eval_data: EmbeddedDataset,
+        model,
+        embedding_model,
+        *,
         top_k_highlight: int = 3,
         retrain_every: int = 10,
         val_fraction: float = 0.0,
         epochs: int = 1,
-        batch_size: int = 16,
+        batch_size: int | None = None,
         threshold: float | None = None,
         query_strategy: QueryStrategy = "margin",
         random_state: int = 42,
         model_save_path: str | Path | None = None,
+        labeled_save_path: str | Path | None = None,
         mlflow_experiment: str | None = None,
     ):
+        self.data = data
+        self.eval_data = eval_data
         self.model = model
-        self.labeled_test_path = Path(labeled_test_path)
-        self.labeled_train_path = Path(labeled_train_path)
-        self.unlabeled_train_path = Path(unlabeled_train_path)
+        self.embedding_model = embedding_model
+
+        # The model consumes embeddings — hand it the (frozen) label vectors
+        # if it cares to keep them (optional hook).
+        if hasattr(model, "set_label_embeddings"):
+            model.set_label_embeddings(data.label_embeddings)
 
         self._retrain_every = retrain_every
         self._val_fraction = val_fraction
         self._epochs = epochs
         self._batch_size = batch_size
-        self._threshold = float(model.threshold if threshold is None else threshold)
+        _model_thr = float(getattr(model, "threshold", 0.5))
+        self._threshold = _model_thr if threshold is None else float(threshold)
         self._query_strategy = query_strategy
         self._random_state = random_state
         self._model_save_path = Path(model_save_path) if model_save_path else None
+        self._labeled_save_path = Path(labeled_save_path) if labeled_save_path else None
         self._mlflow_experiment = mlflow_experiment
 
         self._labels_at_last_train: int = 0
         self._queue: list[int] = []
         self._train_history: list[dict] = []
-        self._eval_df: pd.DataFrame | None = None
-        self._eval_texts: list[str] = []
-        self._eval_truth: np.ndarray | None = None
 
-        pool_df, n_labeled_loaded, n_unlabeled_loaded = self._build_pool(
-            text_column,
-            labels_column,
-        )
-        test_df = self._load_path(
-            self.labeled_test_path,
-            labels_column,
-            require_labels=True,
-        )
+        # Held-out eval set (already preprocessed & fully labeled).
+        self._eval_df = eval_data.df
+        self._eval_texts = eval_data.texts
+        self._eval_text_embeddings = eval_data.text_embeddings
+        self._eval_truth = eval_data.truth_matrix()
 
         super().__init__(
-            embed_model=model,
-            label_dict=model.label_dict,
-            df=pool_df,
-            save_path=self.labeled_train_path,
-            text_column=text_column,
-            labels_column=labels_column,
+            embed_model=embedding_model,
+            label_dict=data.label_dict,
+            df=data.df,
+            save_path=self._labeled_save_path or "labeled_train.csv",
+            text_column=data.text_column,
+            labels_column=data.labels_column,
             top_k_highlight=top_k_highlight,
         )
 
-        self.set_eval_df(test_df)
+        # Label keys/columns the widget owns (no longer read off the model).
+        self._label_keys = [
+            f"{cat}{LABEL_SEP}{lab}" for cat, lab, _ in self.flat_labels
+        ]
 
+        # Use the cached label vectors for the labeling UI too (consistent
+        # with the model and avoids re-encoding).
+        self.label_embeddings = data.label_embeddings
+
+        n_labeled = len(data.labeled_indices())
         print(
-            f"[ActiveLearner] pool ready: {len(pool_df)} rows total "
-            f"({n_labeled_loaded} pre-labeled from {self.labeled_train_path.name}, "
-            f"{n_unlabeled_loaded} new from {self.unlabeled_train_path.name})"
+            f"[ActiveLearner] pool ready: {len(data.df)} rows "
+            f"({n_labeled} pre-labeled) · eval set: {len(self._eval_texts)} rows"
         )
 
         self._labels_at_last_train = self._count_labels()
@@ -151,127 +258,22 @@ class ActiveLearner(LabelingWidget):
             except Exception as e:
                 print(f"[ActiveLearner] mlflow experiment setup failed: {e}")
 
-    def _build_pool(
-        self,
-        text_column: str,
-        labels_column: str,
-    ) -> tuple[pd.DataFrame, int, int]:
-        """Combine ``labeled_train`` + ``unlabeled_train`` into one pool."""
-        unlabeled_df = self._load_path(
-            self.unlabeled_train_path,
-            labels_column,
-            require_labels=False,
-        )
-
-        if self.labeled_train_path.exists():
-            try:
-                labeled_df = self._load_path(
-                    self.labeled_train_path,
-                    labels_column,
-                    require_labels=False,
-                )
-            except Exception as e:
-                print(
-                    f"[ActiveLearner] could not read {self.labeled_train_path}: "
-                    f"{e} — starting with no pre-labeled rows"
-                )
-                labeled_df = pd.DataFrame(
-                    {text_column: [], labels_column: [[] for _ in range(0)]}
-                )
-        else:
-            labeled_df = pd.DataFrame(
-                {text_column: [], labels_column: [[] for _ in range(0)]}
-            )
-
-        labeled_df = labeled_df[
-            labeled_df[labels_column].apply(bool)
-        ].reset_index(drop=True)
-
-        seen = set(labeled_df[text_column].astype(str))
-        unlabeled_new = unlabeled_df[
-            ~unlabeled_df[text_column].astype(str).isin(seen)
-        ].reset_index(drop=True)
-
-        combined = pd.concat([labeled_df, unlabeled_new], ignore_index=True)
-        if labels_column not in combined.columns:
-            combined[labels_column] = [[] for _ in range(len(combined))]
-        return combined, len(labeled_df), len(unlabeled_new)
-
-    def _save(self) -> None:
-        """Persist only labeled rows back to ``labeled_train_path``."""
-        path = self.labeled_train_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        labeled = self.df[
-            self.df[self.labels_column].apply(bool)
-        ].reset_index(drop=True)
-
-        ext = path.suffix.lower()
-        if ext == ".csv":
-            tmp = labeled.copy()
-            tmp[self.labels_column] = tmp[self.labels_column].apply(json.dumps)
-            tmp.to_csv(path, index=False)
-        elif ext == ".parquet":
-            labeled.to_parquet(path, index=False)
-        elif ext == ".json":
-            labeled.to_json(path, orient="records", indent=2)
-        elif ext in (".pkl", ".pickle"):
-            labeled.to_pickle(path)
-        else:
-            raise ValueError(f"unsupported save_path extension: {ext}")
-
-    @staticmethod
-    def _load_path(
-        path: Path,
-        labels_column: str,
-        require_labels: bool,
-    ) -> pd.DataFrame:
-        if not path.exists():
-            raise FileNotFoundError(f"input file not found: {path}")
-
-        ext = path.suffix.lower()
-        if ext == ".csv":
-            df = pd.read_csv(path)
-        elif ext == ".parquet":
-            df = pd.read_parquet(path)
-        elif ext == ".json":
-            df = pd.read_json(path, orient="records")
-        elif ext in (".pkl", ".pickle"):
-            df = pd.read_pickle(path)
-        else:
-            raise ValueError(f"unsupported extension for {path}: {ext}")
-
-        if labels_column in df.columns:
-            df[labels_column] = df[labels_column].apply(
-                LabelingWidget._coerce_label_list
-            )
-        elif require_labels:
-            raise ValueError(
-                f"{path} is missing the '{labels_column}' column"
-            )
-        else:
-            df[labels_column] = [[] for _ in range(len(df))]
+    # ── data plumbing (overrides base file IO) ──────────────────────────
+    def _load_or_init(self, df: pd.DataFrame) -> pd.DataFrame:
+        # The pool DataFrame is already prepared and index-reset by the
+        # EmbeddedDataset; share the object so labels added in the UI propagate
+        # to data.truth_matrix() / labeled_indices().
         return df
 
-    def set_eval_df(self, eval_df: pd.DataFrame) -> None:
-        if self.text_column not in eval_df.columns:
-            raise ValueError(f"eval_df is missing text column '{self.text_column}'")
-        if self.labels_column not in eval_df.columns:
-            raise ValueError(f"eval_df is missing labels column '{self.labels_column}'")
+    def _text_embedding(self, idx: int) -> np.ndarray:
+        # Cached at preprocessing time — never re-encode.
+        return self.data.text_embeddings[idx]
 
-        df = eval_df.copy().reset_index(drop=True)
-        df[self.labels_column] = df[self.labels_column].apply(self._coerce_label_list)
-        df = df[df[self.labels_column].apply(bool)].reset_index(drop=True)
-
-        self._eval_df = df
-        self._eval_texts = df[self.text_column].astype(str).tolist()
-
-        all_keys = [f"{cat}{LABEL_SEP}{lab}" for cat, lab, _ in self.flat_labels]
-        truth = np.zeros((len(df), len(all_keys)), dtype=bool)
-        for r, labs in enumerate(df[self.labels_column]):
-            label_set = set(labs)
-            for c, key in enumerate(all_keys):
-                truth[r, c] = key in label_set
-        self._eval_truth = truth
+    def _save(self) -> None:
+        """Persist only labeled rows to ``labeled_save_path`` (if given)."""
+        if self._labeled_save_path is None:
+            return
+        _save_labeled(self.df, self._labeled_save_path, self.labels_column)
 
     def _build_train_panel(self) -> None:
         self.retrain_input = widgets.BoundedIntText(
@@ -490,12 +492,14 @@ class ActiveLearner(LabelingWidget):
         else:
             specs = []
 
-        if not specs:
-            # Fallback when a model doesn't declare anything — batch size
-            # is owned by the model, so it's deliberately absent here.
+        # ``epochs`` is a training-loop knob the widget always exposes and
+        # forwards to ``model.fit(epochs=...)``, even when the model doesn't
+        # declare it (e.g. the cosine head). Inject it at the front if absent.
+        if not any(s.get("name") == "epochs" for s in specs):
             specs = [
                 {"name": "epochs", "label": "Epochs", "kind": "int",
                  "default": self._epochs, "min": 1, "max": 100, "pso": False},
+                *specs,
             ]
 
         # Constructor-time overrides for common knobs so the widget honors
@@ -699,25 +703,27 @@ class ActiveLearner(LabelingWidget):
         self,
         position: np.ndarray,
         specs: list[dict],
-        train_pairs,
-        eval_pairs,
+        train_embs: np.ndarray,
+        train_truth: np.ndarray,
+        eval_embs: np.ndarray,
+        eval_truth: np.ndarray,
         initial_state,
         metric: str,
         thr: float,
         tune_threshold: bool,
         fixed_hp: dict[str, object] | None = None,
     ) -> tuple[float, dict, dict]:
-        """Train + evaluate one particle. Returns (fitness, hp_decoded, info).
+        """Fit + evaluate one particle. Returns (fitness, hp_decoded, info).
 
         ``specs`` is the PSO-active subset of the model's hyperparameters.
         ``fixed_hp`` are the values for hyperparameters NOT in ``specs`` —
-        they are merged into every ``train()`` call so the particle only
-        varies the selected dimensions.
+        they are merged into every ``fit()`` call so the particle only varies
+        the selected dimensions.
 
-        When ``tune_threshold`` is true and the metric is an F1, the
-        threshold is selected per particle by scanning ``[0.01, 0.99]`` on
-        the model's scores. The chosen threshold is returned in ``info``
-        as ``best_threshold``.
+        Embeddings are cached (frozen encoder), so each particle just refits
+        the head on ``train_embs``/``train_truth`` and re-scores ``eval_embs``.
+        When ``tune_threshold`` is true and the metric is an F1, the threshold
+        is selected per particle by scanning ``[0.01, 0.99]``.
         """
         if hasattr(self.model, "restore_state"):
             try:
@@ -728,35 +734,28 @@ class ActiveLearner(LabelingWidget):
         decoded = self._decode_pso_position(specs, position)
         merged = {**(fixed_hp or {}), **decoded}
         epochs = int(merged.pop("epochs", 1)) if "epochs" in merged else 1
-        if "batch_size" in merged:
-            batch_size: int | None = int(merged.pop("batch_size"))
-        else:
-            batch_size = None  # let the model use its own default
+        merged.pop("batch_size", None)  # batch size is owned by the model
         hp_values = merged
 
         info: dict[str, object] = {}
+
+        def _hp_for_return() -> dict:
+            return {**hp_values, "epochs": epochs}
+
         try:
-            metrics = self.model.train(
-                train_pairs,
+            metrics = self.model.fit(
+                train_embs,
+                train_truth,
+                eval_text_embeddings=eval_embs,
+                eval_truth=eval_truth,
                 epochs=epochs,
-                batch_size=batch_size,
                 log_to_mlflow=False,
                 progress_callback=None,
-                eval_text_label_pairs=eval_pairs,
+                early_stopping_rounds=10,  # XGBoost uses it; others ignore it
                 **hp_values,
             )
         except Exception as e:
-            return (
-                float("inf"),
-                _hp_for_return(),
-                {"error": str(e)},
-            )
-
-        def _hp_for_return() -> dict:
-            out = {**hp_values, "epochs": epochs}
-            if batch_size is not None:
-                out["batch_size"] = batch_size
-            return out
+            return float("inf"), _hp_for_return(), {"error": str(e)}
 
         if metric == "val_loss":
             score = float(metrics.get("mean_val_loss", float("inf")))
@@ -766,32 +765,23 @@ class ActiveLearner(LabelingWidget):
             info["best_threshold"] = thr
         else:
             try:
-                sims = self.model.predict_scores(self._eval_texts)
+                sims = self.model.predict_scores(eval_embs)
             except Exception as e:
-                return (
-                    float("inf"),
-                    _hp_for_return(),
-                    {"error": str(e)},
-                )
+                return float("inf"), _hp_for_return(), {"error": str(e)}
             if tune_threshold:
                 best_thr, best_score = self._best_threshold_for_metric(
-                    sims, self._eval_truth, metric,
+                    sims, eval_truth, metric,
                 )
                 info["best_threshold"] = best_thr
             else:
-                best_thr = thr
                 _, best_score = self._best_threshold_for_metric(
-                    sims, self._eval_truth, metric, grid=np.array([thr]),
+                    sims, eval_truth, metric, grid=np.array([thr]),
                 )
                 info["best_threshold"] = thr
             info[metric] = best_score
             score = -float(best_score)
 
-        return (
-            score,
-            _hp_for_return(),
-            info,
-        )
+        return score, _hp_for_return(), info
 
     def _tune_pso(self) -> None:
         """Run PSO over the user-selected subset of model hyperparameters."""
@@ -811,12 +801,13 @@ class ActiveLearner(LabelingWidget):
             )
             return
 
-        train_pairs = self._build_text_label_pairs()
-        if sum(len(labs) for _, labs in train_pairs) < 2:
+        train_embs, train_truth = self.data.labeled_subset()
+        if int(train_truth.sum()) < 2:
             self._log_train("PSO: need at least 2 labeled (text, label) pairs")
             return
 
-        eval_pairs = self._build_eval_text_label_pairs()
+        eval_embs = self._eval_text_embeddings
+        eval_truth = self._eval_truth
         metric = str(self.pso_metric_input.value)
         if metric != "val_loss" and (
             self._eval_truth is None or not self._eval_texts
@@ -866,6 +857,14 @@ class ActiveLearner(LabelingWidget):
             except Exception as e:
                 self._log_train(f"PSO: snapshot_state failed: {e} (evals will share state)")
 
+        # Embeddings are precomputed once (frozen encoder), so every particle
+        # just refits the head on the same cached vectors — no re-encoding —
+        # and XGBoost early-stops internally (see _pso_evaluate_particle).
+        self._log_train(
+            f"PSO: using cached embeddings — "
+            f"train={len(train_embs)}  eval={len(eval_embs)}"
+        )
+
         try:
             rng = np.random.default_rng(self._random_state)
             positions = lo + (hi - lo) * rng.random((n_particles, d))
@@ -881,7 +880,8 @@ class ActiveLearner(LabelingWidget):
                 thrs = np.empty(len(positions))
                 for i, pos in enumerate(positions):
                     score, hp_decoded, info = self._pso_evaluate_particle(
-                        pos, specs, train_pairs, eval_pairs,
+                        pos, specs, train_embs, train_truth,
+                        eval_embs, eval_truth,
                         initial_state, metric, thr, tune_threshold,
                         fixed_hp=fixed_hp,
                     )
@@ -1075,38 +1075,28 @@ class ActiveLearner(LabelingWidget):
             )
 
     def _compute_eval_snapshot(self, thr: float) -> dict:
-        """Encode + score every eligible row at the current model state."""
+        """Score every eligible row with the current model from cached embeddings.
+
+        Uses ``model.predict_scores`` (XGBoost probabilities once trained,
+        cosine similarities before/zero-shot) on the precomputed text
+        embeddings — no re-encoding.
+        """
         snapshot = {"train": None, "test": None, "threshold": thr}
 
-        col = self.df.columns.get_loc(self.labels_column)
-        text_col = self.df.columns.get_loc(self.text_column)
-        train_idxs = [i for i in range(len(self.df)) if self.df.iat[i, col]]
-        all_keys = list(self.model.label_keys)
-
-        if train_idxs:
-            texts = [str(self.df.iat[i, text_col]) for i in train_idxs]
-            truth = np.zeros((len(train_idxs), len(all_keys)), dtype=bool)
-            for r, i in enumerate(train_idxs):
-                lbls = set(self.df.iat[i, col])
-                for c, key in enumerate(all_keys):
-                    truth[r, c] = key in lbls
-            embs = np.asarray(
-                self.embed_model.encode(texts, normalize_embeddings=True)
-            )
-            sims = embs @ self.label_embeddings.T
+        labeled = self.data.labeled_indices()
+        if labeled:
+            idx = np.asarray(labeled, dtype=int)
+            train_embs = self.data.text_embeddings[idx]
+            truth = self.data.truth_matrix()[idx]
             snapshot["train"] = {
-                "sims": sims,
+                "sims": self.model.predict_scores(train_embs),
                 "truth": truth,
-                "n_eval": len(texts),
+                "n_eval": len(labeled),
             }
 
-        if self._eval_df is not None and len(self._eval_texts) > 0:
-            embs = np.asarray(
-                self.embed_model.encode(self._eval_texts, normalize_embeddings=True)
-            )
-            sims = embs @ self.label_embeddings.T
+        if self._eval_truth is not None and len(self._eval_text_embeddings) > 0:
             snapshot["test"] = {
-                "sims": sims,
+                "sims": self.model.predict_scores(self._eval_text_embeddings),
                 "truth": self._eval_truth,
                 "n_eval": len(self._eval_texts),
             }
@@ -1212,7 +1202,6 @@ class ActiveLearner(LabelingWidget):
 
     def _refresh_queue(self, verbose: bool = False) -> None:
         col = self.df.columns.get_loc(self.labels_column)
-        text_col = self.df.columns.get_loc(self.text_column)
         unlabeled = [i for i in range(len(self.df)) if not self.df.iat[i, col]]
         if not unlabeled:
             self._queue = []
@@ -1220,12 +1209,8 @@ class ActiveLearner(LabelingWidget):
                 self._update_train_status("<span style='color:#888'>no unlabeled rows</span>")
             return
 
-        texts = [str(self.df.iat[i, text_col]) for i in unlabeled]
-        embs = np.asarray(self.embed_model.encode(texts, normalize_embeddings=True))
-        for idx, emb in zip(unlabeled, embs):
-            self._text_emb_cache[idx] = emb
-
-        sims = embs @ self.label_embeddings.T
+        idx = np.asarray(unlabeled, dtype=int)
+        sims = self.model.predict_scores(self.data.text_embeddings[idx])
         thr = float(self.threshold_input.value)
         strategy = self.strategy_input.value
 
@@ -1248,27 +1233,9 @@ class ActiveLearner(LabelingWidget):
                 f"{len(self._queue)} rows</span>"
             )
 
-    def _build_text_label_pairs(self) -> list[tuple[str, list[str]]]:
-        col = self.df.columns.get_loc(self.labels_column)
-        text_col = self.df.columns.get_loc(self.text_column)
-        pairs = []
-        for i in range(len(self.df)):
-            labs = list(self.df.iat[i, col])
-            if labs:
-                pairs.append((str(self.df.iat[i, text_col]), labs))
-        return pairs
-
-    def _build_eval_text_label_pairs(self) -> list[tuple[str, list[str]]]:
-        """Build (text, [label_key]) tuples for the held-out eval_df."""
-        if self._eval_df is None or self._eval_truth is None:
-            return []
-        keys = list(self.model.label_keys)
-        pairs = []
-        for r, text in enumerate(self._eval_texts):
-            labs = [keys[c] for c in range(len(keys)) if self._eval_truth[r, c]]
-            if labs:
-                pairs.append((str(text), labs))
-        return pairs
+    def _labeled_train_arrays(self) -> tuple[np.ndarray, np.ndarray]:
+        """``(text_embeddings, truth)`` for the labeled rows of the pool."""
+        return self.data.labeled_subset()
 
     def _mlflow_run_ctx(self):
         if self._mlflow_experiment is None:
@@ -1284,8 +1251,8 @@ class ActiveLearner(LabelingWidget):
             return None
 
     def _train(self) -> None:
-        pairs = self._build_text_label_pairs()
-        n_pairs = sum(len(labs) for _, labs in pairs)
+        train_embs, train_truth = self._labeled_train_arrays()
+        n_pairs = int(train_truth.sum())
         if n_pairs < 2:
             self.train_status.value = (
                 "<span style='color:#c00'>need at least 2 labeled (text, label) pairs to train</span>"
@@ -1295,11 +1262,6 @@ class ActiveLearner(LabelingWidget):
         hp_values = self._collect_model_hp_values()
         epochs = int(hp_values.get("epochs", self._epochs))
         thr = float(self.threshold_input.value)
-        # Batch size is owned by the model — passing None falls through to
-        # the model's own default (typically "use the full training set").
-        batch_size: int | None = None
-        if "batch_size" in hp_values:
-            batch_size = int(hp_values["batch_size"])
 
         self.train_status.value = (
             f"<span style='color:#666'>training: {n_pairs} pairs, "
@@ -1326,22 +1288,23 @@ class ActiveLearner(LabelingWidget):
             except Exception as e:
                 print(f"[ActiveLearner] mlflow.log_params failed: {e}")
 
-        eval_pairs = self._build_eval_text_label_pairs()
-
-        # ``epochs`` and ``batch_size`` come from hp_values; pass the rest of
-        # the model's declared hyperparameters as kwargs untouched.
+        # ``epochs`` is consumed positionally; forward the rest of the model's
+        # declared hyperparameters as kwargs untouched (batch size is owned by
+        # the model, so it is never forwarded).
         extra_kwargs = {
             k: v for k, v in hp_values.items()
             if k not in {"epochs", "batch_size"}
         }
 
         try:
-            metrics = self.model.train(
-                pairs,
+            metrics = self.model.fit(
+                train_embs,
+                train_truth,
+                eval_text_embeddings=self._eval_text_embeddings,
+                eval_truth=self._eval_truth,
                 epochs=epochs,
-                batch_size=batch_size,
                 progress_callback=self._train_progress_callback,
-                eval_text_label_pairs=eval_pairs,
+                log_to_mlflow=self._mlflow_experiment is not None,
                 **extra_kwargs,
             )
         except Exception as e:
@@ -1359,12 +1322,6 @@ class ActiveLearner(LabelingWidget):
         print(
             f"[ActiveLearner] trained {trainable_params:,} params "
             f"({trainable_pct:.1f}% of total), mean_loss={mean_loss:.4f}"
-        )
-
-        self._text_emb_cache.clear()
-        descriptions = [f"{lab}. {desc}" for _, lab, desc in self.flat_labels]
-        self.label_embeddings = np.asarray(
-            self.embed_model.encode(descriptions, normalize_embeddings=True)
         )
 
         self._labels_at_last_train = self._count_labels()
@@ -1392,30 +1349,32 @@ class ActiveLearner(LabelingWidget):
                 except Exception:
                     pass
 
-    def _gather_train_eval(self, thr: float) -> dict | None:
-        col = self.df.columns.get_loc(self.labels_column)
-        text_col = self.df.columns.get_loc(self.text_column)
-        labeled = [i for i in range(len(self.df)) if self.df.iat[i, col]]
-        if not labeled:
-            return None
+    def _eval_from_embeddings(
+        self, text_embeddings: np.ndarray, truth: np.ndarray, thr: float
+    ) -> dict:
+        """Score embeddings with the model and compute P/R/F1 internally."""
+        sims = self.model.predict_scores(text_embeddings)
+        m = self._metrics_from_sims(sims, np.asarray(truth, dtype=bool), thr)
+        return {
+            "sims": sims,
+            "truth": np.asarray(truth, dtype=bool),
+            "threshold": thr,
+            "n_eval": int(len(text_embeddings)),
+            "label_keys": list(self._label_keys),
+            **m,
+        }
 
-        all_keys = list(self.model.label_keys)
-        texts = [str(self.df.iat[i, text_col]) for i in labeled]
-        truth = np.zeros((len(labeled), len(all_keys)), dtype=bool)
-        for r, i in enumerate(labeled):
-            true_set = set(self.df.iat[i, col])
-            for c, key in enumerate(all_keys):
-                truth[r, c] = key in true_set
-        return self.model.evaluate(texts, truth, threshold=thr, log_to_mlflow=False)
+    def _gather_train_eval(self, thr: float) -> dict | None:
+        train_embs, truth = self._labeled_train_arrays()
+        if len(train_embs) == 0:
+            return None
+        return self._eval_from_embeddings(train_embs, truth, thr)
 
     def _gather_test_eval(self, thr: float) -> dict | None:
-        if self._eval_df is None or len(self._eval_texts) == 0:
+        if self._eval_truth is None or len(self._eval_text_embeddings) == 0:
             return None
-        return self.model.evaluate(
-            self._eval_texts,
-            self._eval_truth,
-            threshold=thr,
-            log_to_mlflow=True,
+        return self._eval_from_embeddings(
+            self._eval_text_embeddings, self._eval_truth, thr
         )
 
     @staticmethod
@@ -1487,7 +1446,7 @@ class ActiveLearner(LabelingWidget):
         """
         out: dict[str, np.ndarray] = {}
 
-        for i, key in enumerate(self.model.label_keys):
+        for i, key in enumerate(self._label_keys):
             out[key] = self._binary_confusion_matrix(
                 actual=truth[:, i],
                 predicted=preds[:, i],
@@ -1647,7 +1606,7 @@ class ActiveLearner(LabelingWidget):
         test_result = _build(test_block)
 
         n_cats = len(self.cat_to_flat_idx)
-        n_labs = len(self.model.label_keys)
+        n_labs = len(self._label_keys)
 
         cat_cols = min(4, max(1, n_cats))
         lab_cols = min(4, max(1, n_labs))
@@ -1832,8 +1791,14 @@ class ActiveLearner(LabelingWidget):
                 "<span style='color:#c00'>no model_save_path was set</span>"
             )
             return
+        if not hasattr(self.model, "save_pretrained"):
+            self.train_status.value = (
+                "<span style='color:#c00'>this model has no save_pretrained()</span>"
+            )
+            return
         try:
-            self.model.threshold = float(self.threshold_input.value)
+            if hasattr(self.model, "threshold"):
+                self.model.threshold = float(self.threshold_input.value)
             self.model.save_pretrained(self._model_save_path)
             self._update_train_status(
                 f"<span style='color:#2a8a2a'>✓ model saved to {self._model_save_path}</span>"
@@ -1846,10 +1811,35 @@ class ActiveLearner(LabelingWidget):
         texts: list[str] | pd.Series,
         threshold: float | None = None,
     ) -> pd.DataFrame:
-        """Pass-through to ``self.model.predict``."""
-        thr = self._threshold if threshold is None else float(threshold)
-        params = {"threshold": thr}
-        return self.model.predict(None, texts, params=params)
+        """Encode ad-hoc ``texts`` and predict per-label and per-category.
+
+        This is the one place the widget uses ``embedding_model`` for fresh
+        text (the pool/eval embeddings are precomputed). Scores come from
+        ``model.predict_scores``; the label/category frame is built here so any
+        model exposing only ``predict_scores`` works.
+        """
+        thr = self._get_prediction_threshold()
+        thr = float(threshold) if threshold is not None else (
+            self._threshold if thr is None else float(thr)
+        )
+        if isinstance(texts, pd.Series):
+            texts = texts.astype(str).tolist()
+        else:
+            texts = [str(t) for t in texts]
+        embs = np.asarray(
+            self.embedding_model.encode(texts, normalize_embeddings=True)
+        )
+        sims = self.model.predict_scores(embs)
+        preds = sims >= thr
+        out = pd.DataFrame(sims, columns=[f"sim::{k}" for k in self._label_keys])
+        for c, k in enumerate(self._label_keys):
+            out[k] = preds[:, c]
+        # Category roll-up: a category is positive iff any of its labels is.
+        for cat, idxs in self.cat_to_flat_idx.items():
+            idxs = np.asarray(idxs, dtype=int)
+            out[f"cat_sim::{cat}"] = sims[:, idxs].max(axis=1)
+            out[f"cat::{cat}"] = preds[:, idxs].any(axis=1)
+        return out
 
     def get_row_scores(
         self,
