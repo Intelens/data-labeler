@@ -8,13 +8,33 @@ train/validation loss. Downstream train_logreg fits the classification head.
 
     python pipelines/finetune_embedding.py   # prompts for the rest
 """
+import tempfile
+
 import mlflow
+import numpy as np
 import typer
 
 from mlflow_wrapper import Store
 from _common import encode_train_test
 
 app = typer.Typer(add_completion=False)
+
+
+class EmbeddingModel(mlflow.pyfunc.PythonModel):
+    """Custom MLflow model wrapping the fine-tuned SentenceTransformer body. Takes a
+    list/Series of texts and returns their embeddings; the body is stored as the
+    `body` artifact and reloaded in load_context."""
+
+    def load_context(self, context):
+        from sentence_transformers import SentenceTransformer
+        self._st = SentenceTransformer(context.artifacts["body"])
+
+    def predict(self, context, model_input, params=None):
+        if hasattr(model_input, "columns"):        # DataFrame -> first column
+            texts = model_input.iloc[:, 0].astype(str).tolist()
+        else:
+            texts = [str(t) for t in model_input]
+        return np.asarray(self._st.encode(texts))
 
 
 def _losses(log_history):
@@ -73,7 +93,11 @@ def main(
              "train_size": len(tr_texts), "test_size": len(te_texts)}
     metrics = {k: v for k, v in {"train_loss": train_loss, "val_loss": val_loss}.items()
                if v is not None}
-    version = store.submit_model(body, model_name, params=hyper, metrics=metrics)
+    # wrap the fine-tuned body in the custom pyfunc model and submit that
+    with tempfile.TemporaryDirectory() as d:
+        body.save(d)
+        version = store.submit_model(EmbeddingModel(), model_name, artifacts={"body": d},
+                                     params=hyper, metrics=metrics)
     typer.echo(f"submitted {use_case}/{model_name} v{version} "
                f"(train_loss={train_loss}, val_loss={val_loss})")
 
