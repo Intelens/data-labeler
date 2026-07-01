@@ -38,9 +38,10 @@ def _flavor(model):
 class Store:
     """MLflow-backed store scoped to a single use_case."""
 
-    def __init__(self, use_case, tracking_uri=None, registry_uri=None):
+    def __init__(self, use_case, tracking_uri=None, registry_uri=None, artifact_location=None):
         _validate("use_case", use_case)
         self.use_case = use_case
+        self.artifact_location = artifact_location
         # Precedence: arg > env var > default.
         self.tracking_uri = tracking_uri or os.getenv("MLFLOW_TRACKING_URI") or "file:./mlruns"
         self.registry_uri = registry_uri or os.getenv("MLFLOW_REGISTRY_URI") or self.tracking_uri
@@ -48,6 +49,13 @@ class Store:
         # if two point at different backends. Fine for the one-backend case; split processes if not.
         mlflow.set_tracking_uri(self.tracking_uri)
         mlflow.set_registry_uri(self.registry_uri)
+
+    def set_experiment(self):
+        """Make the use_case experiment active, creating it with this Store's
+        artifact_location if it doesn't exist yet. Returns the experiment id."""
+        if mlflow.get_experiment_by_name(self.use_case) is None:
+            mlflow.create_experiment(self.use_case, artifact_location=self.artifact_location)
+        return mlflow.set_experiment(self.use_case).experiment_id
 
     def _full_name(self, name):
         _validate("name", name)
@@ -73,7 +81,7 @@ class Store:
             raise TypeError("df must be a pandas DataFrame")
         # ponytail: version=max+1, single-writer assumption; add a registry/lock if concurrent writers
         version = max(self.list_dataset_versions(name), default=0) + 1
-        mlflow.set_experiment(self.use_case)
+        self.set_experiment()
         run_tags = {"type": "dataset", "use_case": self.use_case, "name": name,
                     "version": str(version), **(tags or {})}
         with mlflow.start_run(run_name=f"{name}-v{version}", tags=run_tags):
@@ -105,21 +113,23 @@ class Store:
     # --- models -----------------------------------------------------------
 
     def submit_model(self, model, name, artifacts=None, pip_requirements=None,
-                     base_model=None, base_version=None):
+                     base_model=None, base_version=None, params=None):
         """Log and register a model. xgboost / sklearn / sentence-transformers are
         auto-detected and logged with their native flavor; anything else goes through
         pyfunc (pass a mlflow PythonModel). Returns the registry version (int).
 
         base_model/base_version: if this model uses another registered model, they're
-        recorded as run params for lineage."""
+        recorded as run params for lineage. params: extra run params to log (e.g. classes)."""
         full = self._full_name(name)
         flavor = _flavor(model)
-        mlflow.set_experiment(self.use_case)
+        self.set_experiment()
         with mlflow.start_run(run_name=name,
                               tags={"type": "model", "use_case": self.use_case, "name": name}):
             if base_model is not None:
                 mlflow.log_params({"base_model": base_model,
                                    "base_version": "" if base_version is None else base_version})
+            if params:
+                mlflow.log_params({k: str(v) for k, v in params.items()})
             if flavor is None:
                 info = mlflow.pyfunc.log_model(
                     name="model", python_model=model, artifacts=artifacts,
@@ -133,14 +143,25 @@ class Store:
         client.set_model_version_tag(full, info.registered_model_version, "use_case", self.use_case)
         return int(info.registered_model_version)
 
+    def latest_model_version(self, name):
+        """Highest registered version for name (int). Raises KeyError if none."""
+        full = self._full_name(name)
+        versions = MlflowClient().search_model_versions(f"name = '{full}'")
+        if not versions:
+            raise KeyError(f"no model {full}")
+        return max(int(v.version) for v in versions)
+
+    def model_run_params(self, name, version=None):
+        """Run params logged when this model version was submitted (for reading lineage)."""
+        full = self._full_name(name)
+        version = version or self.latest_model_version(name)
+        run_id = MlflowClient().get_model_version(full, version).run_id
+        return MlflowClient().get_run(run_id).data.params
+
     def get_model(self, name, version=None):
         """Load a registered pyfunc model. version=None loads the highest version."""
         full = self._full_name(name)
-        if version is None:
-            versions = MlflowClient().search_model_versions(f"name = '{full}'")
-            if not versions:
-                raise KeyError(f"no model {full}")
-            version = max(int(v.version) for v in versions)
+        version = version or self.latest_model_version(name)
         return mlflow.pyfunc.load_model(f"models:/{full}/{version}")
 
     # --- runs -------------------------------------------------------------
@@ -148,7 +169,7 @@ class Store:
     def submit_run(self, name, params=None, metrics=None, tags=None):
         """Create a run with standardized name/use_case tags. Returns run_id."""
         _validate("name", name)
-        mlflow.set_experiment(self.use_case)
+        self.set_experiment()
         run_tags = {"type": "run", "use_case": self.use_case, "name": name, **(tags or {})}
         with mlflow.start_run(run_name=name, tags=run_tags) as run:
             if params:
