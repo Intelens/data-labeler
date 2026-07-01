@@ -10,7 +10,7 @@ import numpy as np
 import typer
 
 from mlflow_wrapper import Store
-from _common import embed, multilabel_metrics, split_labeled
+from _common import embed, encode_with, multilabel_metrics
 
 app = typer.Typer(add_completion=False)
 
@@ -36,10 +36,8 @@ def main(
     embed_model, embed_version = lineage["base_model"], int(lineage["base_version"])
     trained = lineage["classes"].split(",")
 
-    texts, Y_true, classes = split_labeled(store.get_dataset(dataset))
-    if classes != trained:
-        raise typer.BadParameter(
-            f"eval labels {classes} != trained classes {trained}")
+    # encode eval labels against the classifier's trained classes (same columns/order)
+    texts, Y_true = encode_with(store.get_dataset(dataset), trained)
 
     embedder = store.get_model(embed_model, embed_version)
     clf = store.get_model(classifier, version)

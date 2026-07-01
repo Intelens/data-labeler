@@ -1,33 +1,41 @@
 """Shared bits for the multi-label text-classification pipelines.
 
-Dataset convention: a `text` column plus one 0/1 column per label. The label
-columns (everything except `text`) are the classes, in column order."""
+Dataset convention: a `text` column and a `labels` column. `labels` is either a
+list of label names or a comma/semicolon-separated string. Labels are multi-hot
+encoded with sklearn's MultiLabelBinarizer (fit on train, applied to test)."""
 import mlflow
 import numpy as np
+from sklearn.preprocessing import MultiLabelBinarizer
 
-TEXT = "text"
-
-
-def split_labeled(df):
-    """(texts, Y, classes) from a dataset DataFrame. Y is an int 0/1 matrix."""
-    if TEXT not in df.columns:
-        raise ValueError(f"dataset needs a '{TEXT}' column")
-    classes = [c for c in df.columns if c != TEXT]
-    if not classes:
-        raise ValueError("dataset needs at least one 0/1 label column besides 'text'")
-    return df[TEXT].astype(str).tolist(), df[classes].astype(int).to_numpy(), classes
+TEXT, LABELS = "text", "labels"
 
 
-def label_pairs(texts, Y):
-    """(anchor, positive) pairs of texts sharing >=1 label — training signal for
-    contrastive fine-tuning.
-    # ponytail: O(n^2) scan; batch/ANN it if the labeled set gets large."""
-    pairs = []
-    for i in range(len(texts)):
-        for j in range(i + 1, len(texts)):
-            if np.any(Y[i] & Y[j]):
-                pairs.append((texts[i], texts[j]))
-    return pairs
+def _rows(df):
+    if TEXT not in df.columns or LABELS not in df.columns:
+        raise ValueError(f"dataset needs '{TEXT}' and '{LABELS}' columns")
+    texts = df[TEXT].astype(str).tolist()
+    labels = []
+    for v in df[LABELS]:
+        items = v if isinstance(v, (list, tuple, set, np.ndarray)) else str(v).replace(";", ",").split(",")
+        labels.append([s.strip() for s in items if str(s).strip()])
+    return texts, labels
+
+
+def encode_train_test(train_df, test_df):
+    """Fit a MultiLabelBinarizer on train labels, transform both.
+    Returns (train_texts, Ytr, test_texts, Yte, mlb)."""
+    tr_texts, tr_labels = _rows(train_df)
+    te_texts, te_labels = _rows(test_df)
+    mlb = MultiLabelBinarizer()
+    return tr_texts, mlb.fit_transform(tr_labels), te_texts, mlb.transform(te_labels), mlb
+
+
+def encode_with(df, classes):
+    """Encode df labels against a fixed class set (for evaluation). Unknown labels
+    are ignored. Returns (texts, Y) with columns in `classes` order."""
+    texts, labels = _rows(df)
+    mlb = MultiLabelBinarizer(classes=list(classes))
+    return texts, mlb.fit_transform(labels)
 
 
 @mlflow.trace

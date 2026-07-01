@@ -1,4 +1,10 @@
-"""Fine-tune a sentence-transformers embedding model on labeled text, then submit it.
+"""Fine-tune an embedding model on labeled text with SetFit, then submit its body.
+
+Loads a train and a test dataset, multi-hot-encodes labels with sklearn's
+MultiLabelBinarizer, and SetFit-fine-tunes the sentence-transformer (SetFit builds
+the contrastive pairs internally). Submits the fine-tuned body (a SentenceTransformer)
+as the "embedder", together with the training arguments, hyperparameters, and
+train/validation loss. Downstream train_logreg fits the classification head.
 
     python pipelines/finetune_embedding.py   # prompts for the rest
 """
@@ -6,35 +12,45 @@ import mlflow
 import typer
 
 from mlflow_wrapper import Store
-from _common import label_pairs, split_labeled
+from _common import encode_train_test
 
 app = typer.Typer(add_completion=False)
 
 
-@mlflow.trace
-def finetune(base_model, texts, Y, epochs, batch_size):
-    """Contrastive fine-tune on same-label pairs. Returns the SentenceTransformer.
-    # ponytail: MultipleNegativesRankingLoss on shared-label pairs, a few epochs —
-    # the standard lazy fine-tune. Swap in a task-specific loss if it underperforms."""
-    from sentence_transformers import InputExample, SentenceTransformer, losses
-    from torch.utils.data import DataLoader
+def _losses(log_history):
+    """Pull the last train and eval loss out of a SetFit/transformers log history.
+    # ponytail: log_history keys drift across versions; scan for known aliases, None if absent."""
+    def last(keys):
+        for h in reversed(log_history or []):
+            for k in keys:
+                if k in h:
+                    return float(h[k])
+        return None
+    return last(["embedding_loss", "loss"]), last(["eval_embedding_loss", "eval_loss"])
 
-    model = SentenceTransformer(base_model)
-    pairs = label_pairs(texts, Y)
-    if not pairs:
-        typer.echo("no same-label pairs to train on; returning base model unchanged")
-        return model
-    loader = DataLoader([InputExample(texts=[a, b]) for a, b in pairs],
-                        shuffle=True, batch_size=max(1, min(batch_size, len(pairs))))
-    model.fit(train_objectives=[(loader, losses.MultipleNegativesRankingLoss(model))],
-              epochs=epochs, show_progress_bar=False)
-    return model
+
+@mlflow.trace
+def finetune(base_model, tr_texts, Ytr, te_texts, Yte, epochs, batch_size):
+    """SetFit-fine-tune on multi-label data with an eval set.
+    Returns (SentenceTransformer body, train_loss, val_loss)."""
+    from datasets import Dataset
+    from setfit import SetFitModel, Trainer, TrainingArguments
+
+    model = SetFitModel.from_pretrained(base_model, multi_target_strategy="one-vs-rest")
+    train_ds = Dataset.from_dict({"text": list(tr_texts), "label": Ytr.tolist()})
+    eval_ds = Dataset.from_dict({"text": list(te_texts), "label": Yte.tolist()})
+    trainer = Trainer(model=model, train_dataset=train_ds, eval_dataset=eval_ds,
+                      args=TrainingArguments(num_epochs=epochs, batch_size=batch_size))
+    trainer.train()
+    train_loss, val_loss = _losses(getattr(trainer.state, "log_history", None))
+    return model.model_body, train_loss, val_loss
 
 
 @app.command()
 def main(
     use_case: str = typer.Option(..., prompt=True, help="Use case / experiment (slug)."),
-    dataset: str = typer.Option(..., prompt=True, help="Labeled dataset name."),
+    train_dataset: str = typer.Option(..., prompt=True, help="Train dataset name."),
+    test_dataset: str = typer.Option(..., prompt=True, help="Test/validation dataset name."),
     base_model: str = typer.Option("sentence-transformers/all-MiniLM-L6-v2", prompt=True,
                                     help="Base model to fine-tune."),
     model_name: str = typer.Option("embedder", prompt=True, help="Name to submit under."),
@@ -44,11 +60,22 @@ def main(
 ):
     store = Store(use_case, tracking_uri=tracking_uri)
     store.set_experiment()  # traces below land in the use_case experiment
-    texts, Y, classes = split_labeled(store.get_dataset(dataset))
-    typer.echo(f"fine-tuning {base_model} on {len(texts)} texts, {len(classes)} labels...")
-    model = finetune(base_model, texts, Y, epochs, batch_size)
-    version = store.submit_model(model, model_name, params={"base_embedding": base_model})
-    typer.echo(f"submitted {use_case}/{model_name} v{version}")
+    tr_texts, Ytr, te_texts, Yte, mlb = encode_train_test(
+        store.get_dataset(train_dataset), store.get_dataset(test_dataset))
+    typer.echo(f"SetFit fine-tuning {base_model} on {len(tr_texts)} train / "
+               f"{len(te_texts)} test texts, {len(mlb.classes_)} labels...")
+
+    body, train_loss, val_loss = finetune(base_model, tr_texts, Ytr, te_texts, Yte,
+                                           epochs, batch_size)
+    hyper = {"trainer": "setfit", "base_model": base_model, "epochs": epochs,
+             "batch_size": batch_size, "multi_target_strategy": "one-vs-rest",
+             "classes": ",".join(mlb.classes_),
+             "train_size": len(tr_texts), "test_size": len(te_texts)}
+    metrics = {k: v for k, v in {"train_loss": train_loss, "val_loss": val_loss}.items()
+               if v is not None}
+    version = store.submit_model(body, model_name, params=hyper, metrics=metrics)
+    typer.echo(f"submitted {use_case}/{model_name} v{version} "
+               f"(train_loss={train_loss}, val_loss={val_loss})")
 
 
 if __name__ == "__main__":
