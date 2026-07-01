@@ -1,0 +1,9 @@
+[project]
+name = "mlflow_wrapper"
+version = "0.1.0"
+description = "Thin MLflow wrapper: versioned parquet datasets, pyfunc models, and runs by use_case."
+requires-python = ">=3.9"
+dependencies = ["mlflow>=3", "pandas", "pyarrow"]
+
+[tool.setuptools]
+packages = ["mlflow_wrapper"]
