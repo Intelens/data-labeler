@@ -130,7 +130,9 @@ def main(
         version = store.submit_model(
             clf, model_name, base_model=embedding_model, base_version=version_used,
             params=hyper, metrics=metrics, signature=signature,
-            run_artifacts={"logs": [str(console)], "predictions": [str(train_csv), str(test_csv)]})
+            run_artifacts={"logs": [str(console)], "predictions": [str(train_csv), str(test_csv)]},
+            code_files=[__file__, str(pathlib.Path(__file__).with_name("_common.py"))],
+            log_requirements=True)
     typer.echo(f"submitted {use_case}/{model_name} v{version}  "
                f"train_loss={metrics['train_loss']:.4f} val_loss={metrics['val_loss']:.4f} scores={scores}")
 

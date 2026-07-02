@@ -22,6 +22,14 @@ def _validate(label, val):
         raise ValueError(f"{label} must match {_SLUG.pattern} and contain no '__': {val!r}")
 
 
+def _pip_freeze():
+    """A pip-freeze of the current env, from installed distribution metadata.
+    # ponytail: no subprocess; editable installs show their version, not a -e path."""
+    import importlib.metadata as im
+    names = {d.metadata["Name"]: d.version for d in im.distributions() if d.metadata["Name"]}
+    return "\n".join(f"{n}=={v}" for n, v in sorted(names.items())) + "\n"
+
+
 def _flavor(model):
     """Pick the mlflow flavor module by inspecting the model's class, or None for
     the generic pyfunc path. No imports of the model libs — just their module names."""
@@ -114,7 +122,7 @@ class Store:
 
     def submit_model(self, model, name, artifacts=None, pip_requirements=None,
                      base_model=None, base_version=None, params=None, metrics=None,
-                     run_artifacts=None, signature=None):
+                     run_artifacts=None, signature=None, code_files=None, log_requirements=False):
         """Log and register a model. xgboost / sklearn / sentence-transformers are
         auto-detected and logged with their native flavor; anything else goes through
         pyfunc (pass a mlflow PythonModel). Returns the registry version (int).
@@ -124,7 +132,9 @@ class Store:
         hyperparameters, classes). metrics: numeric metrics (e.g. train/val loss).
         run_artifacts: {artifact_path: [local files]} logged as run artifacts (e.g.
         {'logs': [console.log], 'predictions': [train.csv, test.csv]}).
-        signature: mlflow ModelSignature stored with the model (input/output schema)."""
+        signature: mlflow ModelSignature stored with the model (input/output schema).
+        code_files: source files logged under 'code/'. log_requirements: capture the
+        current env as 'code/requirements.txt'."""
         full = self._full_name(name)
         flavor = _flavor(model)
         self.set_experiment()
@@ -140,6 +150,13 @@ class Store:
             for path, files in (run_artifacts or {}).items():
                 for fp in files:
                     mlflow.log_artifact(fp, artifact_path=path)
+            for fp in code_files or []:
+                mlflow.log_artifact(fp, artifact_path="code")
+            if log_requirements:
+                with tempfile.TemporaryDirectory() as td:
+                    req = Path(td) / "requirements.txt"
+                    req.write_text(_pip_freeze(), encoding="utf-8")
+                    mlflow.log_artifact(str(req), artifact_path="code")
             if flavor is None:
                 info = mlflow.pyfunc.log_model(
                     name="model", python_model=model, artifacts=artifacts,

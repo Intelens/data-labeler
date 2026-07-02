@@ -140,7 +140,9 @@ def main(
         version = store.submit_model(
             EmbeddingModel(), model_name, artifacts={"body": str(bodydir)},
             params=hyper, metrics=metrics, signature=signature,
-            run_artifacts={"logs": [str(console)], "predictions": [str(train_csv), str(test_csv)]})
+            run_artifacts={"logs": [str(console)], "predictions": [str(train_csv), str(test_csv)]},
+            code_files=[__file__, str(pathlib.Path(__file__).with_name("_common.py"))],
+            log_requirements=True)
     typer.echo(f"submitted {use_case}/{model_name} v{version}  scores={scores}")
 
 

@@ -53,6 +53,16 @@ def test_train_loss_and_metrics():
     assert multilabel_metrics(Y, Y) == {"f1_micro": 1.0, "f1_macro": 1.0, "subset_accuracy": 1.0}
 
 
+def test_grid_search():
+    rng = np.random.default_rng(1)
+    Y = np.array([[1, 0], [1, 0], [1, 0], [0, 1], [0, 1], [0, 1]])
+    X = np.array([[2.0, 0]] * 3 + [[0, 2.0]] * 3) + rng.normal(0, 0.01, (6, 2))
+    clf, best_c, cv_score = train_logreg.grid_search_train(X, Y, [0.1, 1.0, 10.0], 500, cv=2)
+    assert best_c in (0.1, 1.0, 10.0)
+    assert 0.0 <= cv_score <= 1.0
+    assert clf.predict(X).shape == Y.shape        # best_estimator is fitted
+
+
 def test_setfit_loss_scan():
     hist = [{"embedding_loss": 0.5}, {"eval_embedding_loss": 0.4}, {"embedding_loss": 0.2}]
     assert finetune_embedding._losses(hist) == (0.2, 0.4)     # last train, last eval
@@ -97,6 +107,7 @@ def main():
     test_multilabel_encoding()
     test_predictions_frame()
     test_train_loss_and_metrics()
+    test_grid_search()
     test_setfit_loss_scan()
     test_capture_console()
     test_embedding_model_io()
