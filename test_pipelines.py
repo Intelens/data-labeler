@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 import evaluate
 import finetune_embedding
 import train_logreg
-from _common import encode_train_test, encode_with, multilabel_metrics
+from _common import capture_console, encode_train_test, encode_with, multilabel_metrics
 
 
 def test_multilabel_encoding():
@@ -43,6 +43,24 @@ def test_setfit_loss_scan():
     assert finetune_embedding._losses([]) == (None, None)
 
 
+def test_capture_console():
+    import sys
+    with tempfile.TemporaryDirectory() as d:
+        log = Path(d) / "console.log"
+        with capture_console(log):
+            print("hello-stdout")
+            print("oops-stderr", file=sys.stderr)
+        text = log.read_text(encoding="utf-8")
+        assert "hello-stdout" in text and "oops-stderr" in text
+
+
+def test_embedding_model_io():
+    m = finetune_embedding.EmbeddingModel()
+    m._st = type("FakeST", (), {"encode": lambda self, xs: np.arange(len(xs)).reshape(-1, 1)})()
+    assert m.predict(None, ["a", "b"]).shape == (2, 1)                        # list input
+    assert m.predict(None, pd.DataFrame({"text": ["a", "b", "c"]})).shape == (3, 1)  # DataFrame
+
+
 def test_traces_logged():
     with tempfile.TemporaryDirectory() as d:
         mlflow.set_tracking_uri((Path(d) / "mlruns").as_uri())
@@ -63,6 +81,8 @@ def main():
     test_multilabel_encoding()
     test_train_loss_and_metrics()
     test_setfit_loss_scan()
+    test_capture_console()
+    test_embedding_model_io()
     test_traces_logged()
     test_clis_wire_up()
     print("OK")

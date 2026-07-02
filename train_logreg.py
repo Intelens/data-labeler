@@ -50,8 +50,10 @@ def main(
 ):
     store = Store(use_case, tracking_uri=tracking_uri)
     store.set_experiment()  # traces below land in the use_case experiment
+    tr_v = store.list_dataset_versions(train_dataset)[-1]   # versions actually used
+    te_v = store.list_dataset_versions(test_dataset)[-1]
     tr_texts, Ytr, te_texts, Yte, mlb = encode_train_test(
-        store.get_dataset(train_dataset), store.get_dataset(test_dataset))
+        store.get_dataset(train_dataset, tr_v), store.get_dataset(test_dataset, te_v))
     version_used = embedding_version or store.latest_model_version(embedding_model)
     embedder = store.get_model(embedding_model, version_used)
     typer.echo(f"embedding {len(tr_texts)} train / {len(te_texts)} test texts "
@@ -63,6 +65,8 @@ def main(
                "val_loss": mean_log_loss(clf, Xte, Yte)}
     hyper = {"classes": ",".join(mlb.classes_), "C": c, "max_iter": max_iter,
              "embedding_model": embedding_model, "embedding_version": version_used,
+             "train_dataset": f"{train_dataset}:v{tr_v}",
+             "test_dataset": f"{test_dataset}:v{te_v}",
              "train_size": len(tr_texts), "test_size": len(te_texts)}
     version = store.submit_model(clf, model_name, base_model=embedding_model,
                                  base_version=version_used, params=hyper, metrics=metrics)

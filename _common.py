@@ -3,11 +3,38 @@
 Dataset convention: a `text` column and a `labels` column. `labels` is either a
 list of label names or a comma/semicolon-separated string. Labels are multi-hot
 encoded with sklearn's MultiLabelBinarizer (fit on train, applied to test)."""
+import contextlib
+import sys
+
 import mlflow
 import numpy as np
 from sklearn.preprocessing import MultiLabelBinarizer
 
 TEXT, LABELS = "text", "labels"
+
+
+class _Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, s):
+        for st in self.streams:
+            st.write(s)
+
+    def flush(self):
+        for st in self.streams:
+            st.flush()
+
+
+@contextlib.contextmanager
+def capture_console(path):
+    """Tee stdout+stderr to `path` while still printing live.
+    # ponytail: catches direct writes and tqdm; logging handlers bound to the old
+    # stream before entry won't be captured — good enough for training output."""
+    with open(path, "w", encoding="utf-8") as f:
+        with contextlib.redirect_stdout(_Tee(sys.stdout, f)), \
+             contextlib.redirect_stderr(_Tee(sys.stderr, f)):
+            yield
 
 
 def _rows(df):
