@@ -114,7 +114,7 @@ class Store:
 
     def submit_model(self, model, name, artifacts=None, pip_requirements=None,
                      base_model=None, base_version=None, params=None, metrics=None,
-                     log_files=None, signature=None):
+                     run_artifacts=None, signature=None):
         """Log and register a model. xgboost / sklearn / sentence-transformers are
         auto-detected and logged with their native flavor; anything else goes through
         pyfunc (pass a mlflow PythonModel). Returns the registry version (int).
@@ -122,7 +122,8 @@ class Store:
         base_model/base_version: if this model uses another registered model, they're
         recorded as run params for lineage. params: extra run params (training args,
         hyperparameters, classes). metrics: numeric metrics (e.g. train/val loss).
-        log_files: local paths logged as run artifacts under 'logs/' (e.g. console output).
+        run_artifacts: {artifact_path: [local files]} logged as run artifacts (e.g.
+        {'logs': [console.log], 'predictions': [train.csv, test.csv]}).
         signature: mlflow ModelSignature stored with the model (input/output schema)."""
         full = self._full_name(name)
         flavor = _flavor(model)
@@ -136,8 +137,9 @@ class Store:
                 mlflow.log_params({k: str(v) for k, v in params.items()})
             if metrics:
                 mlflow.log_metrics({k: float(v) for k, v in metrics.items()})
-            for fp in log_files or []:
-                mlflow.log_artifact(fp, artifact_path="logs")
+            for path, files in (run_artifacts or {}).items():
+                for fp in files:
+                    mlflow.log_artifact(fp, artifact_path=path)
             if flavor is None:
                 info = mlflow.pyfunc.log_model(
                     name="model", python_model=model, artifacts=artifacts,
