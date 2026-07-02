@@ -37,32 +37,43 @@ def capture_console(path):
             yield
 
 
-def _rows(df):
-    if TEXT not in df.columns or LABELS not in df.columns:
-        raise ValueError(f"dataset needs '{TEXT}' and '{LABELS}' columns")
+def _rows(df, labels_col=LABELS):
+    if TEXT not in df.columns or labels_col not in df.columns:
+        raise ValueError(f"dataset needs '{TEXT}' and '{labels_col}' columns")
     texts = df[TEXT].astype(str).tolist()
     labels = []
-    for v in df[LABELS]:
+    for v in df[labels_col]:
         items = v if isinstance(v, (list, tuple, set, np.ndarray)) else str(v).replace(";", ",").split(",")
         labels.append([s.strip() for s in items if str(s).strip()])
     return texts, labels
 
 
-def encode_train_test(train_df, test_df):
+def encode_train_test(train_df, test_df, labels_col=LABELS):
     """Fit a MultiLabelBinarizer on train labels, transform both.
     Returns (train_texts, Ytr, test_texts, Yte, mlb)."""
-    tr_texts, tr_labels = _rows(train_df)
-    te_texts, te_labels = _rows(test_df)
+    tr_texts, tr_labels = _rows(train_df, labels_col)
+    te_texts, te_labels = _rows(test_df, labels_col)
     mlb = MultiLabelBinarizer()
     return tr_texts, mlb.fit_transform(tr_labels), te_texts, mlb.transform(te_labels), mlb
 
 
-def encode_with(df, classes):
+def encode_with(df, classes, labels_col=LABELS):
     """Encode df labels against a fixed class set (for evaluation). Unknown labels
     are ignored. Returns (texts, Y) with columns in `classes` order."""
-    texts, labels = _rows(df)
+    texts, labels = _rows(df, labels_col)
     mlb = MultiLabelBinarizer(classes=list(classes))
     return texts, mlb.fit_transform(labels)
+
+
+def predictions_frame(texts, Y_true, Y_pred, mlb):
+    """Table of text + true/predicted label sets (semicolon-joined) for logging as a
+    UI-viewable CSV artifact."""
+    import pandas as pd
+    true = mlb.inverse_transform(np.asarray(Y_true))
+    pred = mlb.inverse_transform(np.asarray(Y_pred))
+    return pd.DataFrame({"text": list(texts),
+                         "true": [";".join(t) for t in true],
+                         "predicted": [";".join(p) for p in pred]})
 
 
 @mlflow.trace
