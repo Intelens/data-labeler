@@ -44,6 +44,7 @@ def main(
     embedding_model: str = typer.Option("embedder", prompt=True, help="Embedding model name."),
     embedding_version: int = typer.Option(None, help="Embedding version; else latest."),
     model_name: str = typer.Option("classifier", prompt=True, help="Name to submit under."),
+    target_column: str = typer.Option("labels", prompt=True, help="Label column in the datasets."),
     c: float = typer.Option(1.0, prompt="Inverse regularization (C)", help="LogReg C."),
     max_iter: int = typer.Option(1000, help="LogReg max_iter."),
     tracking_uri: str = typer.Option(None, help="MLflow tracking URI; else env/default."),
@@ -53,7 +54,8 @@ def main(
     tr_v = store.list_dataset_versions(train_dataset)[-1]   # versions actually used
     te_v = store.list_dataset_versions(test_dataset)[-1]
     tr_texts, Ytr, te_texts, Yte, mlb = encode_train_test(
-        store.get_dataset(train_dataset, tr_v), store.get_dataset(test_dataset, te_v))
+        store.get_dataset(train_dataset, tr_v), store.get_dataset(test_dataset, te_v),
+        labels_col=target_column)
     version_used = embedding_version or store.latest_model_version(embedding_model)
     embedder = store.get_model(embedding_model, version_used)
     typer.echo(f"embedding {len(tr_texts)} train / {len(te_texts)} test texts "

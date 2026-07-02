@@ -10,7 +10,8 @@ from typer.testing import CliRunner
 import evaluate
 import finetune_embedding
 import train_logreg
-from _common import capture_console, encode_train_test, encode_with, multilabel_metrics
+from _common import (capture_console, encode_train_test, encode_with,
+                     multilabel_metrics, predictions_frame)
 
 
 def test_multilabel_encoding():
@@ -24,6 +25,21 @@ def test_multilabel_encoding():
     _, Y = encode_with(pd.DataFrame({"text": ["x"], "labels": ["sport,weather"]}),
                        ["news", "sport"])
     assert Y.tolist() == [[0, 1]]
+    # custom target column
+    tr2, _, _, _, _ = encode_train_test(
+        pd.DataFrame({"text": ["a"], "cats": ["x"]}),
+        pd.DataFrame({"text": ["b"], "cats": ["x"]}), labels_col="cats")
+    assert tr2 == ["a"]
+
+
+def test_predictions_frame():
+    from sklearn.preprocessing import MultiLabelBinarizer
+    mlb = MultiLabelBinarizer().fit([["news", "sport"]])
+    df = predictions_frame(["a", "b"], np.array([[1, 0], [0, 1]]),
+                           np.array([[1, 1], [0, 1]]), mlb)
+    assert list(df.columns) == ["text", "true", "predicted"]
+    assert df["true"].tolist() == ["news", "sport"]
+    assert df["predicted"].tolist() == ["news;sport", "sport"]
 
 
 def test_train_loss_and_metrics():
@@ -79,6 +95,7 @@ def test_clis_wire_up():
 
 def main():
     test_multilabel_encoding()
+    test_predictions_frame()
     test_train_loss_and_metrics()
     test_setfit_loss_scan()
     test_capture_console()

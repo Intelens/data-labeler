@@ -26,6 +26,7 @@ def main(
     dataset: str = typer.Option(..., prompt=True, help="Labeled eval dataset name."),
     classifier: str = typer.Option("classifier", prompt=True, help="Classifier model name."),
     classifier_version: int = typer.Option(None, help="Classifier version; else latest."),
+    target_column: str = typer.Option("labels", prompt=True, help="Label column in the dataset."),
     run_name: str = typer.Option("eval", prompt=True, help="Name for the eval run."),
     tracking_uri: str = typer.Option(None, help="MLflow tracking URI; else env/default."),
 ):
@@ -37,7 +38,7 @@ def main(
     trained = lineage["classes"].split(",")
 
     # encode eval labels against the classifier's trained classes (same columns/order)
-    texts, Y_true = encode_with(store.get_dataset(dataset), trained)
+    texts, Y_true = encode_with(store.get_dataset(dataset), trained, labels_col=target_column)
 
     embedder = store.get_model(embed_model, embed_version)
     clf = store.get_model(classifier, version)
