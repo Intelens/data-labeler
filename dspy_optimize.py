@@ -1,26 +1,56 @@
-"""Optimize a multi-label comment classifier with DSPy, LM served by local vLLM.
+"""Optimize a multi-label comment classifier with DSPy, vLLM loaded in-process.
 
-Start the vLLM OpenAI-compatible server first:
-    vllm serve Qwen/Qwen2.5-7B-Instruct --port 8000
-Then:
-    python dspy_optimize.py
+No HTTP server: the vLLM engine runs inside this process behind a tiny custom
+DSPy LM. (The server version is `dspy_optimize.py`.)
+
+    pip install dspy vllm
+    python dspy_optimize_offline.py
 
 Reuses labeled_demo.csv (text + a stringified label list). The label set is
 derived from the data; DSPy (MIPROv2) tunes the instruction + few-shot demos.
 """
 import ast
+import os
 import random
 from types import SimpleNamespace
 
 import dspy
 import pandas as pd
+from openai.types.chat import ChatCompletion, ChatCompletionMessage
+from openai.types.chat.chat_completion import Choice
 
-# ── config ───────────────────────────────────────────────────────────────
-MODEL = "openai/Qwen/Qwen2.5-7B-Instruct"     # any model your vLLM is serving
-API_BASE = "http://localhost:8000/v1"
+MODEL = os.getenv("VLLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 DATA_PATH = "labeled_demo.csv"
 
-dspy.configure(lm=dspy.LM(MODEL, api_base=API_BASE, api_key="EMPTY", model_type="chat"))
+
+# ── in-process vLLM behind DSPy's LM interface ───────────────────────────
+class VLLMOffline(dspy.BaseLM):
+    """Runs a vLLM engine in this process (no server); DSPy reads .choices[].message.content.
+
+    ponytail: legacy forward contract; if DSPy warns, pass forward_contract='legacy'
+    to super().__init__ or move to the typed LMRequest/LMResponse API.
+    """
+
+    def __init__(self, model, temperature=0.0, max_tokens=1000):
+        super().__init__(model=model)
+        from vllm import LLM, SamplingParams
+        self.llm = LLM(model=model)              # weights load here, in-process
+        self.SamplingParams = SamplingParams
+        self.temperature, self.max_tokens = temperature, max_tokens
+
+    def forward(self, prompt=None, messages=None, **kwargs):
+        messages = messages or [{"role": "user", "content": prompt}]
+        params = self.SamplingParams(
+            temperature=kwargs.get("temperature", self.temperature),
+            max_tokens=kwargs.get("max_tokens", self.max_tokens),
+        )
+        text = self.llm.chat(messages, params)[0].outputs[0].text
+        return ChatCompletion(
+            id="vllm", created=0, model=self.model, object="chat.completion",
+            choices=[Choice(index=0, finish_reason="stop",
+                            message=ChatCompletionMessage(role="assistant", content=text))],
+        )
+
 
 # ── data ─────────────────────────────────────────────────────────────────
 df = pd.read_csv(DATA_PATH)
@@ -67,6 +97,7 @@ def _check_metric():
 # ── optimize + evaluate ──────────────────────────────────────────────────
 def main():
     _check_metric()
+    dspy.configure(lm=VLLMOffline(MODEL))     # loads the model now
     from dspy.teleprompt import MIPROv2
 
     evaluate = dspy.Evaluate(devset=testset, metric=f1, display_progress=True)
