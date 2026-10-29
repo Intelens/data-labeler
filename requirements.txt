@@ -1,0 +1,4 @@
+pragmatiq[train]==1.1.0
+numpy
+pyarrow
+scikit-learn
