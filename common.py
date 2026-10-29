@@ -1,10 +1,9 @@
 """Shared by the journeyModeller pipelines: folders, the split, how raw source codes map to events, reading silver."""
-import os
-import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))  # pragmaLib, next to pipelines/
 DATA = ROOT / "data"
 BRONZE, SILVER, GOLD = DATA / "bronze", DATA / "silver", DATA / "gold"
 MODELS, REPORTS = ROOT / "models", ROOT / "reports"
@@ -17,14 +16,8 @@ RAW = {"email_sent": ("crm", "EMAIL_SENT"), "email_opened": ("crm", "EMAIL_OPEN"
        "banner_shown": ("crm", "BANNER_IMPRESSION"), "banner_clicked": ("crm", "BANNER_CLICK"), "unsubscribed": ("crm", "UNSUBSCRIBE"),
        "page_visited": ("app", "page_view"), "application": ("app", "application_submitted"),
        "contract_signed": ("core", "CONTRACT"), "account_opened": ("core", "ACCOUNT_OPEN"), "contract_terminated": ("core", "CONTRACT_END")}
-SOURCE = {"crm": "communication", "app": "app", "core": "transaction"}  # pragmatiq's event sources, per system
+SOURCE = {"crm": "communication", "app": "app", "core": "transaction"}  # the event's source, per system
 CONTENT_FIELD = {"email": "subject", "push": "message", "phone": "script", "in_app": "banner"}  # the CRM's content column
-
-
-def utf8() -> None:
-    """ponytail: pragmatiq reads its files in the platform encoding; on Windows, re-run this script in UTF-8 mode."""
-    if os.name == "nt" and not sys.flags.utf8_mode:
-        sys.exit(subprocess.call([sys.executable, "-X", "utf8", *sys.argv]))
 
 
 def read_silver(path: Path) -> tuple[dict, list]:

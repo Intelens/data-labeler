@@ -21,6 +21,8 @@ from datetime import datetime
 import numpy as np
 from common import BRONZE, CONTENT_FIELD, RAW, SILVER, SOURCE
 
+if not (BRONZE / "crm_contacts.csv").exists():
+    raise SystemExit("no raw exports yet: run pipelines/01_bronze.py first")
 EVENT = {(system, code): event for event, (system, code) in RAW.items()}
 events, unknown = defaultdict(set), defaultdict(int)  # customer -> {(time in microseconds, source, event, fields)}
 
@@ -62,7 +64,7 @@ with open(BRONZE / "customers.csv", newline="", encoding="utf-8") as fh:
     profiles = {r.pop("customer_id"): r for r in csv.DictReader(fh)}
 
 shutil.rmtree(SILVER, ignore_errors=True)
-SILVER.mkdir(parents=True)
+SILVER.mkdir(parents=True, exist_ok=True)
 n_events = 0
 for cid in sorted(set(events) | set(profiles)):
     lines = ["\t".join(["profile", *(f"{k}={v}" for k, v in profiles.get(cid, {}).items())])]

@@ -4,87 +4,41 @@ As PRAGMA evaluates its embeddings: freeze the model, embed customers, fit a sma
 is looked at on 8 snapshot dates, two weeks apart; the history before the date goes through the frozen foundation
 model (one embedding, with the profile), and each task asks what happens in the 7 days after it: will they convert,
 open an email, click a banner, ... One logistic regression per task, fit on the train customers of pipeline 3,
-scored on the test customers, next to a baseline that knows only counts: each event type in the history and in
-the last 30 days, days since the last event, and the profile's numbers. And both together, as when embeddings are
-added to existing propensity models.
+scored on the test customers, next to a baseline that knows only counts (pipelines/downstream.py), and both
+together, as when embeddings are added to existing propensity models.
 
 Reads  models/foundation/ (pipeline 4), data/silver/ (pipeline 2), data/gold/split.json (pipeline 3)
 Writes reports/downstream.md + downstream.json
 
-Run:  python pipelines/05_downstream.py       (needs: pip install "pragmatiq[train]==1.1.0" scikit-learn)
+Run:  python pipelines/05_downstream.py
 """
 import json
 
-from common import DAY_US, GOLD, MODELS, REPORTS, SILVER, read_silver, utf8
+import numpy as np
+from common import MODELS, REPORTS
+from downstream import EVERY_DAYS, HORIZON_DAYS, TASKS, probe, snapshots
 
-utf8()
-import numpy as np  # noqa: E402
-from pragmatiq.models.pragmatiq import PragmaModel  # noqa: E402
-from sklearn.linear_model import LogisticRegression  # noqa: E402
-from sklearn.metrics import average_precision_score, roc_auc_score  # noqa: E402
-from sklearn.pipeline import make_pipeline  # noqa: E402
-from sklearn.preprocessing import StandardScaler  # noqa: E402
+from pragmaLib.model import embed, load
 
-HORIZON_DAYS, SNAPSHOTS, EVERY_DAYS = 7, 8, 14
-TASKS = {"converts (contract signed)": "contract_signed", "applies for a product": "application", "opens an email": "email_opened",
-         "opens a push message": "push_opened", "clicks a banner": "banner_clicked", "answers a call": "call_answered",
-         "visits a page": "page_visited", "unsubscribes": "unsubscribed", "terminates a contract": "contract_terminated"}
-PROFILE_NUMBERS = ("age", "monthly_income", "customer_since_years")
-
-if not (MODELS / "foundation" / "checkpoints" / "last.pt").exists():
+if not (MODELS / "foundation" / "model.pt").exists():
     raise SystemExit("no foundation model yet: run pipelines/04_train.py first")
-model = PragmaModel.from_pretrained(MODELS / "foundation")
-split = json.loads((GOLD / "split.json").read_text(encoding="utf-8"))
-test_ids = set(split["test"])
-customers = {p.stem: read_silver(p) for p in sorted(SILVER.glob("*.txt"))}
-names = sorted({f["event"] for _, evs in customers.values() for _, _, f in evs})
-end = max(evs[-1][0] for _, evs in customers.values() if evs)
-H = HORIZON_DAYS * DAY_US
-cutoffs = [end - H - k * EVERY_DAYS * DAY_US for k in range(SNAPSHOTS)]
-
-
-def counts(hist, t, attrs):  # the baseline's view: how often each event happened, how recently, the profile's numbers
-    every = [f["event"] for _, _, f in hist]
-    recent = [f["event"] for ts, _, f in hist if ts >= t - 30 * DAY_US]
-    return [*(every.count(n) for n in names), *(recent.count(n) for n in names), np.log1p((t - hist[-1][0]) / DAY_US), len(hist),
-            *(float(attrs.get(k, 0)) for k in PROFILE_NUMBERS)]
-
-
-records, base, labels, is_test = [], [], [], []
-for cid, (attrs, evs) in customers.items():
-    for t in cutoffs:
-        hist = [e for e in evs if e[0] < t]
-        if not hist:
-            continue
-        coming = {f["event"] for ts, _, f in evs if t <= ts < t + H}
-        records.append({"user_id": cid, "events": hist, "attributes": attrs, "lifelong": []})
-        base.append(counts(hist, t, attrs))
-        labels.append([e in coming for e in TASKS.values()])
-        is_test.append(cid in test_ids)
-print(f"{len(records):,} snapshots of {len(customers):,} customers ({sum(is_test):,} of test customers); embedding them ...")
-E = np.vstack([model.embed_records(records[i:i + 1024]) for i in range(0, len(records), 1024)])
-B, Y, te = np.array(base, dtype=float), np.array(labels), np.array(is_test)
-inputs = {"counts": B, "embedding": E, "counts + embedding": np.hstack([B, E])}
+model, tok = load(MODELS / "foundation")
+s = snapshots(8)
+te, Y = s["te"], s["Y"]
+print(f"{len(te):,} snapshots ({te.sum():,} of test customers); embedding them ...")
+E = embed(model, tok, s["records"])
+res = {name: probe(X, Y, te) for name, X in {"counts": s["base"], "embedding": E, "counts + embedding": np.hstack([s["base"], E])}.items()}
 
 results = []
 for j, (task, event) in enumerate(TASKS.items()):
-    y = Y[:, j]
-    r = {"task": task, "event": event, "rate": round(float(y[te].mean()), 4), "positives_test": int(y[te].sum())}
-    if y[~te].sum() < 20 or y[te].sum() < 10:
-        results.append({**r, "skipped": "too few positives"})
-        continue
-    for name, X in inputs.items():
-        clf = make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000)).fit(X[~te], y[~te])
-        p = clf.predict_proba(X[te])[:, 1]
-        r[name] = {"auc": round(float(roc_auc_score(y[te], p)), 3), "ap": round(float(average_precision_score(y[te], p)), 3)}
-    results.append(r)
-
+    r = {"task": task, "event": event, "rate": round(float(Y[te, j].mean()), 4), "positives_test": int(Y[te, j].sum())}
+    results.append({**r, **{n: res[n][task] for n in res}} if res["counts"][task] else {**r, "skipped": "too few positives"})
 REPORTS.mkdir(exist_ok=True)
-(REPORTS / "downstream.json").write_text(json.dumps({"horizon_days": HORIZON_DAYS, "snapshots": SNAPSHOTS, "every_days": EVERY_DAYS,
-                                                     "rows": len(records), "test_rows": int(te.sum()), "tasks": results}, indent=2), encoding="utf-8")
+(REPORTS / "downstream.json").write_text(json.dumps({"horizon_days": HORIZON_DAYS, "snapshots": 8, "every_days": EVERY_DAYS,
+                                                     "rows": len(te), "test_rows": int(te.sum()), "tasks": results}, indent=2), encoding="utf-8")
 lines = [f"# Downstream tasks: what happens in the {HORIZON_DAYS} days after a snapshot", "",
          f"Logistic regression per task, fit on {int((~te).sum()):,} snapshots of train customers, scored on {int(te.sum()):,} snapshots "
-         f"of test customers ({SNAPSHOTS} snapshot dates, {EVERY_DAYS} days apart). ROC-AUC: 0.5 is a coin flip, 1 is perfect. "
+         f"of test customers (8 snapshot dates, {EVERY_DAYS} days apart). ROC-AUC: 0.5 is a coin flip, 1 is perfect. "
          "Average precision (AP): compare it with the base rate. Gain: AUC of the embedding over the counts baseline.", "",
          "| Task | Base rate | AUC counts | AUC embedding | AUC counts + embedding | AP counts | AP embedding | AP counts + embedding | Gain |",
          "|---|---|---|---|---|---|---|---|---|"]

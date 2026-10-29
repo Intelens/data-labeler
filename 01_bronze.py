@@ -153,7 +153,7 @@ for i in range(N_CUSTOMERS):
 
 # ---------------------------------------------------------------- export, the way each source system would
 shutil.rmtree(BRONZE, ignore_errors=True)
-BRONZE.mkdir(parents=True)
+BRONZE.mkdir(parents=True, exist_ok=True)  # a file held open elsewhere can keep the folder
 by = {"crm": [], "app": [], "core": []}
 for cid, ts, event, f in sorted(rows, key=lambda r: r[1]):  # exports come in time order, all customers mixed
     system, code = RAW[event]
