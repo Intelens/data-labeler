@@ -1,0 +1,1187 @@
+diff experiments/ablation.py
+--- a/experiments/ablation.py
++++ b/experiments/ablation.py
+@@ -83,7 +83,8 @@
+         ev = [[x for x in m if "downstream" in x] for m in metrics]
+         a2.plot([x["step"] for x in ev[0]], np.mean([[np.mean([x["downstream"][t] for t in tasks if t in x["downstream"]]) for x in e] for e in ev], 0),
+                 marker="o", color=f"C{i}", label=v)
+-    a2.axhline(mean({t: runs[0]["baseline4"][t] for t in tasks}), color="black", linestyle="--", linewidth=0.8, label="counts baseline")
++    b4 = runs[0]["baseline4"]  # the 4-date evaluation may lack the rarest tasks
++    a2.axhline(float(np.mean([b4[t] for t in tasks if t in b4])), color="black", linestyle="--", linewidth=0.8, label="counts baseline")
+     a1.set_xlabel("pretraining step"), a1.set_ylabel("masked-modelling loss (mean of seeds)"), a1.legend(fontsize=8)
+     a2.set_xlabel("pretraining step"), a2.set_ylabel("mean ROC-AUC over the tasks (4 snapshot dates)"), a2.legend(fontsize=8)
+     fig.suptitle("pragmaLib variants: pretraining loss and downstream AUC during training")
+diff experiments/gpu.sh
+--- /dev/null
++++ b/experiments/gpu.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++# The GPU experiment on one fresh instance, from nothing to reports: environment, data, pretraining runs with
++# downstream evaluation during training, and the significance report per run. Logs in logs/; done = logs/done.txt.
++#   bash experiments/gpu.sh            (CUDA wheels: TORCH_INDEX=https://download.pytorch.org/whl/cu128 by default)
++set -euo pipefail
++cd "$(dirname "$0")/.."
++mkdir -p logs
++export PATH="$HOME/.local/bin:$PATH"
++command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
++[ -x .venv/bin/python ] || uv venv --python 3.11 .venv -q
++uv pip install --python .venv -q torch --index-url "${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
++uv pip install --python .venv -q numpy scikit-learn matplotlib
++PY=.venv/bin/python
++$PY -c "import torch; assert torch.cuda.is_available(), 'no GPU'; print(torch.__version__, torch.cuda.get_device_name())" | tee logs/env.txt
++[ -f data/gold/tokens/train.pkl ] || { $PY pipelines/01_bronze.py "${CUSTOMERS:-20000}" && $PY pipelines/02_silver.py && $PY pipelines/03_gold.py; } > logs/data.txt 2>&1
++run() {  # name, then pipeline-4 arguments
++  name=$1; shift
++  $PY pipelines/04_train.py --name "$name" --token-budget 32768 --eval-every 250 "$@" > "logs/04_$name.txt" 2>&1
++  $PY pipelines/05_downstream.py --name "$name" > "logs/05_$name.txt" 2>&1
++}
++for spec in ${RUNS:-"nano:nano:2000" "small:small:2000"}; do  # name:size:steps
++  IFS=: read -r name size steps <<< "$spec"
++  run "$name" --size "$size" --steps "$steps"
++done
++echo done > logs/done.txt
+diff pipelines/01_bronze.py
+--- a/pipelines/01_bronze.py
++++ b/pipelines/01_bronze.py
+@@ -1,8 +1,19 @@
+-"""Pipeline 1 · Create raw events data -> data/bronze.
+-
+-A year of fake bank customers: what the bank did (emails, push messages, calls, in-app banners) and what each
+-customer did (opened, visited a page, applied, signed a contract). Hidden traits steer every reaction: a favourite
+-topic, a favourite channel, the hours they are active, and a profile that leans on both.
++"""Pipeline 1 · Create raw events data -> data/bronze, from personas.
++
++Every customer is one of eight personas, a type of bank customer whose characteristics drive everything they do:
++the profile (age, income, tenure, plan, devices), the hours and days they are active, how often they use the app,
++which products interest them (with seasons: savings in January, mortgages in spring, cards before Christmas), how
++they respond to each channel and to which kind of message (offers, information, aspiration), and how likely they
++are to convert, churn and unsubscribe. Some have a life event: a young family needs a mortgage this year. Each
++customer varies around their persona.
++
++The bank behaves like a bank: email campaigns every three weeks on a Tuesday or Thursday to everyone still
++subscribed, push campaigns to app users, advice calls on weekdays in office hours to wealthier and older
++customers, banners only inside app sessions. Customers react at their own hours: an email is opened at their next
++active moment or not at all, less often after many contacts that week; a click leads to pages on its topic, maybe
++an application, an approval (mortgages and cards depend on income), a contract and an account; some contracts end
++later; irrelevant emails lead to unsubscribing. Amounts follow the product: mortgages 3–5.5× yearly income over
++20–30 years, card limits up to €15,000, deposits scaled to income.
+ 
+ Written the way three source systems would export it, each in its own format:
+   bronze/crm_contacts.csv     contacts and reactions: ISO times with Z, raw codes (EMAIL_SENT, CALL_CONNECTED, ...),
+@@ -10,6 +21,7 @@
+   bronze/app_events.jsonl     page views and applications: epoch milliseconds, nested props, dwell in ms; ~1% duplicates
+   bronze/core_banking.csv     contracts and accounts: ';'-separated, dd-mm-yyyy times, amounts in euro
+   bronze/customers.csv        one row per customer: age, income, tenure, plan, country
++Hidden truth, never in bronze: data/truth/personas.csv, each customer's persona.
+ 
+ Run:  python pipelines/01_bronze.py [customers]       (default 2,000)
+ """
+@@ -19,137 +31,252 @@
+ import sys
+ 
+ import numpy as np
+-from common import BRONZE, CONTENT_FIELD, DAY_US, RAW, SEED
+-
+-N_CUSTOMERS, DAYS, START = int(sys.argv[1]) if len(sys.argv) > 1 else 2000, 365, "2026-01-01"
+-HOUR_US = 3_600_000_000
+-PROFILE = {"age": (18, 80), "monthly_income": (1200, 9000), "customer_since_years": (0, 25),
+-           "plan": ["standard", "plus", "premium"], "country": ["NL", "DE", "GB"]}
++from common import BRONZE, CONTENT_FIELD, DATA, DAY_US, RAW, SEED
++
++N_CUSTOMERS, DAYS, START = int(sys.argv[1]) if len(sys.argv) > 1 else 2000, 365, "2026-01-01"  # a Thursday
++HOUR_US, MIN_US = 3_600_000_000, 60_000_000
+ TOPICS = ["savings", "credit_card", "investing", "mortgage"]
+-PROFILE_EFFECTS = {"age": {"call_made": 1.2, "email_sent": 0.5, "push_sent": -1.0, "banner_shown": -0.7},
+-                   "monthly_income": {"investing": 1.0, "mortgage": 0.8, "credit_card": -0.5}}
+-FIRST_EVENT = {"email_sent": 0.22, "push_sent": 0.20, "call_made": 0.10, "banner_shown": 0.13, "page_visited": 0.35}
+-PEAK_HOURS, HOUR_SPREAD, STRENGTH = [8, 12, 20], 2.0, 1.5
+-# event: who acts, its fields (fixed, a list to pick from, a (min, max) range, or content items whose appeal
+-# scales the response), the delay after the previous event in minutes, and what follows with which weight
+-EVENTS = {
+-    "email_sent": {"role": "action", "next": {"email_opened": 0.42, "end": 0.58}, "fields": {"channel": "email", "content": [
+-        {"subject": "Your savings could earn 4% more this year", "topic": "savings", "appeal": 1.4},
+-        {"subject": "Savings account: quarterly update", "topic": "savings", "appeal": 0.7},
+-        {"subject": "0% on balance transfers - ends Friday", "topic": "credit_card", "appeal": 1.3},
+-        {"subject": "Your new card benefits explained", "topic": "credit_card", "appeal": 0.8},
+-        {"subject": "Start investing from 1 euro", "topic": "investing", "appeal": 1.2},
+-        {"subject": "Market outlook for the next quarter", "topic": "investing", "appeal": 0.6},
+-        {"subject": "Mortgage rates just dropped", "topic": "mortgage", "appeal": 1.3},
+-        {"subject": "Thinking about buying a home?", "topic": "mortgage", "appeal": 0.9}]}},
+-    "email_opened": {"role": "reaction", "delay": (5, 720), "next": {"page_visited": 0.31, "unsubscribed": 0.02, "end": 0.67},
+-                     "fields": {"channel": "email", "read_seconds": (2, 120)}},
+-    "push_sent": {"role": "action", "next": {"push_opened": 0.30, "end": 0.70}, "fields": {"channel": "push", "content": [
+-        {"message": "Your savings rate just went up", "topic": "savings", "appeal": 1.3},
+-        {"message": "Round up purchases into savings", "topic": "savings", "appeal": 0.8},
+-        {"message": "0% balance transfer, today only", "topic": "credit_card", "appeal": 1.2},
+-        {"message": "Your card now gives cashback", "topic": "credit_card", "appeal": 0.9},
+-        {"message": "Markets moved: check your portfolio", "topic": "investing", "appeal": 1.1},
+-        {"message": "Invest your spare change", "topic": "investing", "appeal": 0.8},
+-        {"message": "Mortgage rates dropped today", "topic": "mortgage", "appeal": 1.3},
+-        {"message": "See what you could borrow", "topic": "mortgage", "appeal": 0.8}]}},
+-    "push_opened": {"role": "reaction", "delay": (0, 120), "next": {"page_visited": 0.55, "end": 0.45}, "fields": {"channel": "push"}},
+-    "call_made": {"role": "action", "next": {"call_answered": 0.45, "end": 0.55}, "fields": {"channel": "phone", "content": [
+-        {"script": "Savings review call", "topic": "savings", "appeal": 1.0},
+-        {"script": "Credit card upgrade offer", "topic": "credit_card", "appeal": 0.9},
+-        {"script": "Investment advice call", "topic": "investing", "appeal": 1.1},
+-        {"script": "Mortgage advice call", "topic": "mortgage", "appeal": 1.2}]}},
+-    "call_answered": {"role": "reaction", "delay": (0, 0), "next": {"application": 0.35, "page_visited": 0.20, "end": 0.45},
+-                      "fields": {"channel": "phone", "duration_minutes": (2, 30), "notes": [
+-                          {"notes": "customer interested in {topic}, follow-up planned", "appeal": 1.8},
+-                          {"notes": "reviewed finances, {topic} fits their goals - sent application link", "appeal": 2.0},
+-                          {"notes": "explained {topic} options, customer will think about it", "appeal": 1.0},
+-                          {"notes": "customer wants to compare {topic} offers first", "appeal": 0.6},
+-                          {"notes": "customer not interested in {topic} right now", "appeal": 0.2}]}},
+-    "banner_shown": {"role": "action", "next": {"banner_clicked": 0.28, "end": 0.72}, "fields": {
+-        "channel": "in_app", "slot": ["home_top", "home_mid", "product_list"], "content": [
+-            {"banner": "Earn 4% on your savings", "topic": "savings", "appeal": 1.2},
+-            {"banner": "Cashback on every card purchase", "topic": "credit_card", "appeal": 1.1},
+-            {"banner": "Invest your spare change", "topic": "investing", "appeal": 1.0},
+-            {"banner": "Check what you can borrow", "topic": "mortgage", "appeal": 0.9}]}},
+-    "banner_clicked": {"role": "reaction", "delay": (0, 2), "next": {"page_visited": 0.90, "end": 0.10}, "fields": {"channel": "in_app"}},
+-    "page_visited": {"role": "reaction", "delay": (0, 30), "next": {"page_visited": 0.20, "application": 0.33, "end": 0.47},
+-                     "fields": {"device": ["web", "app"], "dwell_seconds": (5, 300)}},
+-    "application": {"role": "reaction", "delay": (1, 60), "next": {"contract_signed": 0.61, "end": 0.39}, "fields": {"device": ["web", "app", "branch"]}},
+-    "contract_signed": {"role": "reaction", "delay": (60, 10080), "next": {"account_opened": 1.0},
+-                        "fields": {"device": ["web", "app", "branch"], "contract_value": (500, 50000), "term_months": ["12", "24", "36", "60"]}},
+-    "account_opened": {"role": "reaction", "delay": (60, 4320), "next": {"contract_terminated": 0.12, "end": 0.88}, "fields": {"product_status": "active"}},
+-    "unsubscribed": {"role": "reaction", "delay": (0, 5), "next": {}, "fields": {"channel": "email"}},
+-    "contract_terminated": {"role": "reaction", "delay": (43200, 345600), "next": {},
+-                            "fields": {"reason": ["switched provider", "no longer needed", "contract matured", "fees too high"]}},
++COUNTRIES = {"NL": 0.5, "DE": 0.3, "GB": 0.2}
++SEASON = {"savings": {1: 1.6, 12: 1.4}, "mortgage": {3: 1.5, 4: 1.7, 5: 1.6, 6: 1.3}, "credit_card": {11: 1.5, 12: 1.7}}
++# Per persona: population share; age, monthly income (EUR), tenure in years; plan and device mix; peak hours and
++# weekend activity; app sessions per month; interest per product; response per channel (open an email or push,
++# answer a call, click a banner); appeal of each message tone; propensity to convert, churn per contract per year,
++# unsubscribe; an optional life event (product, chance this year); why their contracts end.
++PERSONAS = {
++    "student": dict(share=.10, age=(18, 24), income=(500, 1800), tenure=(0, 4), plan={"standard": .9, "plus": .1},
++                    device={"app": .85, "web": .15}, hours=[13, 22, 23], weekend=1.3, sessions=3.0,
++                    topics={"credit_card": .45, "savings": .30, "investing": .25, "mortgage": .0},
++                    channels={"email": .12, "push": .30, "phone": .10, "in_app": .12}, tone={"offer": .6, "info": .1, "aspire": .3},
++                    convert=1.0, churn=.20, unsub=.03, reasons={"no longer needed": .5, "switched provider": .3, "fees too high": .2}),
++    "young_saver": dict(share=.16, age=(23, 32), income=(1800, 3500), tenure=(0, 8), plan={"standard": .6, "plus": .4},
++                        device={"app": .8, "web": .2}, hours=[8, 21], weekend=1.1, sessions=2.5,
++                        topics={"savings": .45, "investing": .30, "credit_card": .15, "mortgage": .10},
++                        channels={"email": .18, "push": .35, "phone": .15, "in_app": .15}, tone={"offer": .3, "info": .2, "aspire": .5},
++                        convert=1.0, churn=.10, unsub=.02, reasons={"switched provider": .4, "no longer needed": .4, "fees too high": .2}),
++    "young_family": dict(share=.14, age=(28, 42), income=(2800, 6000), tenure=(2, 15), plan={"standard": .4, "plus": .5, "premium": .1},
++                         device={"app": .6, "web": .4}, hours=[7, 20, 21], weekend=1.4, sessions=1.5,
++                         topics={"mortgage": .45, "savings": .35, "credit_card": .15, "investing": .05},
++                         channels={"email": .30, "push": .20, "phone": .25, "in_app": .10}, tone={"offer": .3, "info": .5, "aspire": .2},
++                         convert=1.2, churn=.05, unsub=.01, need=("mortgage", .45),
++                         reasons={"contract matured": .4, "no longer needed": .3, "switched provider": .3}),
++    "professional": dict(share=.14, age=(30, 50), income=(5000, 11000), tenure=(3, 20), plan={"plus": .4, "premium": .6},
++                         device={"app": .5, "web": .5}, hours=[12, 13, 21], weekend=.7, sessions=1.0,
++                         topics={"investing": .45, "mortgage": .25, "savings": .20, "credit_card": .10},
++                         channels={"email": .25, "push": .12, "phone": .20, "in_app": .08}, tone={"offer": .1, "info": .6, "aspire": .3},
++                         convert=1.1, churn=.06, unsub=.03, reasons={"contract matured": .4, "switched provider": .3, "no longer needed": .3}),
++    "bargain_hunter": dict(share=.12, age=(25, 55), income=(2000, 5000), tenure=(0, 10), plan={"standard": .8, "plus": .2},
++                           device={"app": .7, "web": .3}, hours=[19, 22], weekend=1.2, sessions=2.0,
++                           topics={"credit_card": .50, "savings": .35, "mortgage": .10, "investing": .05},
++                           channels={"email": .30, "push": .30, "phone": .10, "in_app": .18}, tone={"offer": .85, "info": .05, "aspire": .1},
++                           convert=1.3, churn=.35, unsub=.02, reasons={"switched provider": .6, "fees too high": .3, "no longer needed": .1}),
++    "investor": dict(share=.10, age=(45, 68), income=(5000, 14000), tenure=(8, 30), plan={"plus": .3, "premium": .7},
++                     device={"web": .6, "app": .4}, hours=[7, 9, 18], weekend=1.0, sessions=1.5,
++                     topics={"investing": .65, "savings": .25, "mortgage": .05, "credit_card": .05},
++                     channels={"email": .35, "push": .10, "phone": .40, "in_app": .06}, tone={"offer": .05, "info": .8, "aspire": .15},
++                     convert=1.0, churn=.04, unsub=.01, reasons={"contract matured": .6, "no longer needed": .2, "switched provider": .2}),
++    "retiree": dict(share=.12, age=(65, 88), income=(1500, 4000), tenure=(15, 45), plan={"standard": .6, "plus": .4},
++                    device={"web": .7, "branch": .3}, hours=[9, 10, 15], weekend=.9, sessions=.4,
++                    topics={"savings": .70, "investing": .20, "credit_card": .05, "mortgage": .05},
++                    channels={"email": .20, "push": .03, "phone": .60, "in_app": .03}, tone={"offer": .1, "info": .7, "aspire": .2},
++                    convert=.8, churn=.03, unsub=.02, reasons={"contract matured": .7, "no longer needed": .3}),
++    "dormant": dict(share=.12, age=(20, 75), income=(1200, 5000), tenure=(1, 25), plan={"standard": .9, "plus": .1},
++                    device={"web": .5, "app": .5}, hours=[12, 20], weekend=1.0, sessions=.15,
++                    topics={"savings": .40, "credit_card": .30, "investing": .15, "mortgage": .15},
++                    channels={"email": .03, "push": .03, "phone": .08, "in_app": .03}, tone={"offer": .4, "info": .3, "aspire": .3},
++                    convert=.4, churn=.10, unsub=.06, reasons={"no longer needed": .6, "switched provider": .4}),
+ }
+-ACTIONS = [e for e, v in EVENTS.items() if v["role"] == "action"]
++# what the bank sends: (text, product, tone)
++EMAILS = [("Your savings could earn 4% more this year", "savings", "offer"), ("Savings account: quarterly update", "savings", "info"),
++          ("0% on balance transfers - ends Friday", "credit_card", "offer"), ("Your new card benefits explained", "credit_card", "info"),
++          ("Start investing from 1 euro", "investing", "aspire"), ("Market outlook for the next quarter", "investing", "info"),
++          ("Mortgage rates just dropped", "mortgage", "offer"), ("Thinking about buying a home?", "mortgage", "aspire")]
++PUSHES = [("Your savings rate just went up", "savings", "offer"), ("Round up purchases into savings", "savings", "aspire"),
++          ("0% balance transfer, today only", "credit_card", "offer"), ("Your card now gives cashback", "credit_card", "offer"),
++          ("Markets moved: check your portfolio", "investing", "info"), ("Invest your spare change", "investing", "aspire"),
++          ("Mortgage rates dropped today", "mortgage", "offer"), ("See what you could borrow", "mortgage", "aspire")]
++CALLS = {"savings": "Savings review call", "credit_card": "Credit card upgrade offer", "investing": "Investment advice call",
++         "mortgage": "Mortgage advice call"}
++BANNERS = [("Earn 4% on your savings", "savings", "offer"), ("Cashback on every card purchase", "credit_card", "offer"),
++           ("Invest your spare change", "investing", "aspire"), ("Check what you can borrow", "mortgage", "aspire")]
+ rng = np.random.default_rng(SEED)
+ T0 = int(np.datetime64(START, "us").astype(np.int64))
+-
+-
+-def value(spec):
+-    if isinstance(spec, tuple):
+-        lo, hi = spec
+-        return int(rng.integers(lo, hi + 1))
+-    return spec[rng.integers(len(spec))] if isinstance(spec, list) else spec
+-
+-
+-def pick(weights, bias, lift=1.0):  # the next event; lift > 1 makes going on likelier
+-    keys = list(weights) or ["end"]
+-    w = np.array([weights.get(k, 1.0) * bias[k] * (1.0 if k == "end" else lift) for k in keys])
++T_END = T0 + DAYS * DAY_US
++
++
++def pick(weights):
++    keys = list(weights)
++    w = np.array([weights[k] for k in keys], dtype=float)
+     return keys[rng.choice(len(keys), p=w / w.sum())]
+ 
+ 
+-rows, customers = [], []  # rows: (customer, time in microseconds, event, fields)
++def month(ts):
++    return int(str(np.datetime64(ts, "us"))[5:7])
++
++
++def season(topic, ts):
++    return SEASON.get(topic, {}).get(month(ts), 1.0)
++
++
++def weekday(day):  # Monday = 0; day 0 is Thursday 1 January
++    return (day + 3) % 7
++
++
++# ---------------------------------------------------------------- the bank's calendar, the same for every customer
++def seasonal_content(items, ts):
++    return items[rng.choice(len(items), p=(w := np.array([season(t, ts) for _, t, _ in items])) / w.sum())]
++
++
++email_campaigns, day = [], 4
++while day < DAYS:
++    day += {1: 0, 3: 0}.get(weekday(day), (1 - weekday(day)) % 7)  # move to the next Tuesday (or keep a Thursday)
++    ts = T0 + day * DAY_US + int(rng.choice([9, 17]) * HOUR_US)
++    email_campaigns.append((ts, seasonal_content(EMAILS, ts)))
++    day += int(rng.integers(19, 24))
++push_campaigns = []
++for m in range(12):
++    for _ in range(int(rng.integers(1, 3))):
++        ts = T0 + (m * 30 + int(rng.integers(0, 30))) * DAY_US + int(rng.choice([12.5, 19]) * HOUR_US)
++        push_campaigns.append((ts, seasonal_content(PUSHES, ts)))
++banner_of_month = {m: BANNERS[rng.choice(len(BANNERS), p=(w := np.array([season(t, T0 + (m * 30 + 15) * DAY_US) for _, t, _ in BANNERS])) / w.sum())]
++                   for m in range(1, 13)}
++
++# ---------------------------------------------------------------- customers
++rows, customers, truth = [], [], []  # rows: (customer, time in microseconds, event, fields)
++names = list(PERSONAS)
+ for i in range(N_CUSTOMERS):
+-    cid = f"c_{i:05d}"
+-    profile = {k: value(spec) for k, spec in PROFILE.items()}
+-    bias = dict(zip([*EVENTS, "end"], rng.lognormal(0, 0.5, len(EVENTS) + 1)))  # individual propensity per event
+-    taste = dict(zip(TOPICS, rng.dirichlet(np.ones(len(TOPICS)))))  # hidden: favourite topic
+-    likes = dict(zip(ACTIONS, rng.dirichlet(np.ones(len(ACTIONS)))))  # hidden: favourite channel
+-    fav_hour = float((rng.choice(PEAK_HOURS) + rng.normal(0, 1)) % 24)  # hidden: when they are active
+-    for attr, effects in PROFILE_EFFECTS.items():
+-        lo, hi = PROFILE[attr]
+-        z = 2 * (profile[attr] - lo) / (hi - lo) - 1
+-        for trait in (taste, likes):
+-            for k in trait.keys() & effects.keys():
+-                trait[k] *= np.exp(effects[k] * z)
+-    for trait in (taste, likes):
+-        total = sum(trait.values())
+-        for k in trait:
+-            trait[k] /= total
+-    customers.append({"customer_id": cid, **profile})
+-    for _ in range(int(rng.integers(4, 17))):  # journeys
+-        step = pick(FIRST_EVENT, bias)
+-        own = EVENTS[step]["role"] == "reaction"  # customers start their own journeys at their own hours
+-        hour = (fav_hour + rng.normal(0, HOUR_SPREAD)) % 24 if own else rng.uniform(0, 24)
+-        ts = T0 + int(rng.integers(DAYS)) * DAY_US + int(hour * HOUR_US)
+-        topic = TOPICS[rng.choice(len(TOPICS), p=list(taste.values()))]
+-        for n in range(50):
+-            if step == "end":
+-                break
+-            ev = EVENTS[step]
+-            if n:
+-                ts += int(value(ev.get("delay", (1, 1440))) * 60_000_000)
+-            if ts >= T0 + DAYS * DAY_US:
+-                break
+-            fields, appeal = {}, 1.0
+-            for k, spec in ev["fields"].items():
+-                if isinstance(spec, list) and isinstance(spec[0], dict):  # content: one item, its appeal counts
+-                    item = dict(spec[rng.integers(len(spec))])
+-                    appeal *= item.pop("appeal", 1.0)
+-                    fields.update({ck: cv.format(topic=topic) for ck, cv in item.items()})
+-                else:
+-                    fields[k] = value(spec)
+-            topic = fields.pop("topic", topic)
+-            rows.append((cid, ts, step, {"topic": topic, **fields}))
+-            lift = appeal * (len(TOPICS) * taste[topic]) ** STRENGTH
+-            if ev["role"] == "action":  # a good hour, a channel they like?
+-                off = abs((ts / HOUR_US - fav_hour + 12) % 24 - 12)
+-                lift *= (0.2 + 1.8 * np.exp(-off ** 2 / (2 * HOUR_SPREAD ** 2))) ** STRENGTH
+-                lift *= (len(ACTIONS) * likes[step]) ** STRENGTH
+-            step = pick(ev["next"], bias, lift)
++    cid, persona = f"c_{i:05d}", names[rng.choice(len(names), p=[PERSONAS[n]["share"] for n in names])]
++    P = PERSONAS[persona]
++    age, income = int(rng.integers(P["age"][0], P["age"][1] + 1)), int(round(rng.uniform(*P["income"]), -1))
++    customers.append({"customer_id": cid, "age": age, "monthly_income": income,
++                      "customer_since_years": min(int(rng.integers(P["tenure"][0], P["tenure"][1] + 1)), age - 18),
++                      "plan": pick(P["plan"]), "country": pick(COUNTRIES)})
++    truth.append({"customer_id": cid, "persona": persona})
++    # the customer: their persona, with individual variation
++    interest = dict(zip(TOPICS, rng.dirichlet([20 * P["topics"][t] + 0.5 for t in TOPICS])))
++    tone = dict(zip(P["tone"], rng.dirichlet([10 * v + 0.5 for v in P["tone"].values()])))
++    respond = {c: min(0.95, v * rng.lognormal(0, 0.3)) for c, v in P["channels"].items()}
++    peaks = [(h + rng.normal(0, 0.7)) % 24 for h in P["hours"]]
++    sessions, convert = P["sessions"] * rng.lognormal(0, 0.4), P["convert"] * rng.lognormal(0, 0.25)
++    churn, unsub = P["churn"] * rng.lognormal(0, 0.25), P["unsub"] * rng.lognormal(0, 0.25)
++    devices = {d: w for d, w in P["device"].items() if d != "branch"}
++    uses_app = P["device"].get("app", 0) >= 0.4
++    need = None
++    if "need" in P and rng.random() < P["need"][1]:
++        start = T0 + int(rng.integers(0, 300)) * DAY_US
++        need = (P["need"][0], start, start + int(rng.integers(60, 120)) * DAY_US)
++    ev = []  # (time, event, fields), sorted at the end
++    signed = set()  # products signed this year: no second mortgage
++
++    def fit(topic, tn):  # how well a message suits them, 0..1
++        return (interest[topic] / max(interest.values())) ** 0.8 * (tone[tn] / max(tone.values())) ** 0.6
++
++    def needs(topic, ts):
++        return need is not None and need[0] == topic and need[1] <= ts < need[2] and topic not in signed
++
++    def hour_fit(h):  # is this hour near one of their active hours
++        return max(np.exp(-min(abs(h - p), 24 - abs(h - p)) ** 2 / 4.5) for p in peaks)
++
++    def next_active(ts, within_days=3):  # their next active moment after ts, or None
++        for d in range(within_days + 1):
++            day0 = (ts - T0) // DAY_US + d
++            for p in sorted(peaks):
++                t = T0 + day0 * DAY_US + int((p + rng.normal(0, 0.5)) % 24 * HOUR_US)
++                if t > ts and rng.random() < 0.6:
++                    return t
++        return None
++
++    def recent_contacts(ts):
++        return sum(1 for t, e, _ in ev if e in ("email_sent", "push_sent", "call_made") and ts - 7 * DAY_US <= t < ts)
++
++    def apply(ts, topic, device):
++        """An application, the bank's decision, the contract, the account and maybe, later, the end."""
++        if ts >= T_END or topic in signed and topic == "mortgage":
++            return
++        ev.append((ts, "application", {"topic": topic, "device": device}))
++        approve = {"mortgage": 0.75 if income >= 3000 else 0.15, "credit_card": 0.8 if income >= 1200 else 0.4}.get(topic, 0.97)
++        if rng.random() > approve:
++            return
++        t = ts + int((rng.uniform(14, 45) if topic == "mortgage" else rng.uniform(0.05, 3)) * DAY_US)
++        value = {"mortgage": income * 12 * rng.uniform(3, 5.5), "credit_card": min(15000, income * rng.uniform(0.5, 2)),
++                 "savings": income * rng.uniform(1, 12), "investing": income * rng.uniform(0.2, 4)}[topic]
++        term = {"mortgage": rng.choice(["240", "300", "360"]), "savings": rng.choice(["12", "24", "36"])}.get(topic, "")
++        ev.append((t, "contract_signed", {"topic": topic, "device": device, "contract_value": int(round(value, -1)), "term_months": term}))
++        signed.add(topic)
++        ev.append((t + int(rng.uniform(1, 3) * DAY_US), "account_opened", {"topic": topic, "product_status": "active"}))
++        if topic != "mortgage" and rng.random() < churn:
++            ev.append((t + int(rng.uniform(30, 300) * DAY_US), "contract_terminated", {"topic": topic, "reason": pick(P["reasons"])}))
++
++    def visit(ts, topic, device, boost=1.0):
++        """Pages on a topic (more when they need it), maybe leading to an application."""
++        for _ in range(int(rng.geometric(0.6)) + (2 if needs(topic, ts) else 0)):
++            ev.append((ts, "page_visited", {"topic": topic, "device": device, "dwell_seconds": int(min(900, 20 + rng.lognormal(3.8, 0.8)))}))
++            p = 0.035 * convert * boost * season(topic, ts) * interest[topic] / max(interest.values()) * (5 if needs(topic, ts) else 1)
++            if rng.random() < p:
++                return apply(ts + int(rng.uniform(1, 40) * MIN_US),
++                             topic, "branch" if rng.random() < P["device"].get("branch", 0) else device)
++            ts += int(rng.uniform(0.5, 6) * MIN_US)
++
++    # their own app sessions: at their hours, more on weekends if they like those, more while they need something
++    for _ in range(rng.poisson(sessions * 12 * (1.5 if need else 1))):
++        day = int(rng.integers(DAYS))
++        if rng.random() > min(1.0, (P["weekend"] if weekday(day) >= 5 else 1.0) / max(1.0, P["weekend"])):
++            continue
++        ts = T0 + day * DAY_US + int((rng.choice(peaks) + rng.normal(0, 1)) % 24 * HOUR_US)
++        w = {t: interest[t] * season(t, ts) * (4 if needs(t, ts) else 1) for t in TOPICS}
++        device = pick(devices)
++        if rng.random() < 0.3:  # the banner of the month, shown in the app
++            text, topic, tn = banner_of_month[month(ts)]
++            ev.append((ts, "banner_shown", {"topic": topic, "channel": "in_app", "slot": rng.choice(["home_top", "home_mid", "product_list"]),
++                                            "banner": text}))
++            if rng.random() < respond["in_app"] * (0.3 + 0.7 * fit(topic, tn)):
++                ev.append((ts + int(rng.uniform(5, 60) * 1e6), "banner_clicked", {"topic": topic, "channel": "in_app"}))
++                visit(ts + MIN_US, topic, device, boost=2)
++                continue
++        visit(ts, pick(w), device)
++    # the bank's email campaigns
++    for ts, (text, topic, tn) in email_campaigns:
++        ts += int(rng.uniform(0, 40) * MIN_US)  # sent in batches
++        if any(e == "unsubscribed" and t < ts for t, e, _ in ev):
++            break
++        f = fit(topic, tn) * (1.5 if needs(topic, ts) else 1)
++        tired = 0.85 ** recent_contacts(ts)
++        ev.append((ts, "email_sent", {"topic": topic, "channel": "email", "subject": text}))
++        if rng.random() < respond["email"] * (0.3 + 0.7 * min(1, f)) * tired and (t := next_active(ts)) is not None:
++            ev.append((t, "email_opened", {"topic": topic, "channel": "email", "read_seconds": int(min(300, rng.lognormal(3, 0.7)))}))
++            if rng.random() < 0.15 + 0.5 * min(1, f):
++                visit(t + int(rng.uniform(1, 5) * MIN_US), topic, pick(devices), boost=2)
++            elif rng.random() < unsub * (1 - min(1, f)) * 3:
++                ev.append((t + int(rng.uniform(1, 60) * 1e6), "unsubscribed", {"topic": topic, "channel": "email"}))
++    # push campaigns, to app users
++    if uses_app:
++        for ts, (text, topic, tn) in push_campaigns:
++            ev.append((ts, "push_sent", {"topic": topic, "channel": "push", "message": text}))
++            h = (ts - T0) % DAY_US / HOUR_US
++            if rng.random() < respond["push"] * (0.3 + 0.7 * fit(topic, tn)) * hour_fit(h) * 0.85 ** recent_contacts(ts):
++                t = ts + int(rng.uniform(0, 30) * MIN_US)
++                ev.append((t, "push_opened", {"topic": topic, "channel": "push"}))
++                if rng.random() < 0.5:
++                    visit(t + MIN_US, topic, "app", boost=2)
++    # advice calls: weekdays in office hours, to wealthier and older customers, about what suits their segment
++    if income >= 4500 or age >= 60 or need:
++        segment = {"investor": "investing", "professional": "investing", "retiree": "savings", "young_family": "mortgage"}.get(persona)
++        for m in range(12):
++            if rng.random() > 0.2:
++                continue
++            day = m * 30 + int(rng.integers(0, 28))
++            day += {5: 2, 6: 1}.get(weekday(day), 0)
++            ts = T0 + day * DAY_US + int(rng.uniform(10, 16) * HOUR_US)
++            topic = need[0] if need and needs(need[0], ts) else segment or max(interest, key=interest.get)
++            ev.append((ts, "call_made", {"topic": topic, "channel": "phone", "script": CALLS[topic]}))
++            if rng.random() < respond["phone"] * (0.5 + 0.5 * hour_fit((ts - T0) % DAY_US / HOUR_US)):
++                f = fit(topic, "info")
++                notes = (f"customer interested in {topic}, follow-up planned" if f > 0.6 else
++                         f"explained {topic} options, customer will think about it" if f > 0.3 else f"customer not interested in {topic} right now")
++                ev.append((ts + MIN_US, "call_answered", {"topic": topic, "channel": "phone", "duration_minutes": int(rng.integers(2, 6 + int(20 * f))),
++                                                           "notes": notes}))
++                if rng.random() < 0.25 * convert * f:
++                    apply(ts + int(rng.uniform(0.5, 3) * DAY_US), topic, pick(devices))
++    rows += [(cid, t, e, {k: (str(v) if not isinstance(v, str) else v) for k, v in f.items()}) for t, e, f in ev if t < T_END]
+ 
+ # ---------------------------------------------------------------- export, the way each source system would
+ shutil.rmtree(BRONZE, ignore_errors=True)
+@@ -158,7 +285,6 @@
+ for cid, ts, event, f in sorted(rows, key=lambda r: r[1]):  # exports come in time order, all customers mixed
+     system, code = RAW[event]
+     by[system].append((cid, ts, code, f))
+-content_of = {v: k for k, v in CONTENT_FIELD.items()}
+ with open(BRONZE / "crm_contacts.csv", "w", newline="", encoding="utf-8") as fh:
+     w = csv.writer(fh)
+     w.writerow(["customer_id", "event_time", "channel", "event_type", "content", "topic", "details"])
+@@ -168,7 +294,7 @@
+                     f["topic"], json.dumps(details) if details else ""])
+ with open(BRONZE / "app_events.jsonl", "w", encoding="utf-8") as fh:
+     for cid, ts, code, f in by["app"]:
+-        props = {"topic": f["topic"], "device": f["device"], **({"dwell_ms": f["dwell_seconds"] * 1000} if "dwell_seconds" in f else {})}
++        props = {"topic": f["topic"], "device": f["device"], **({"dwell_ms": int(f["dwell_seconds"]) * 1000} if "dwell_seconds" in f else {})}
+         line = json.dumps({"user": cid, "ts": ts // 1000, "name": code, "props": props}) + "\n"
+         fh.write(line * (2 if rng.random() < 0.01 else 1))  # the app's retries send ~1% twice
+ with open(BRONZE / "core_banking.csv", "w", newline="", encoding="utf-8") as fh:
+@@ -181,4 +307,10 @@
+     w = csv.DictWriter(fh, fieldnames=list(customers[0]))
+     w.writeheader()
+     w.writerows(customers)
+-print(f"{len(rows):,} events of {N_CUSTOMERS:,} customers -> {BRONZE}: " + ", ".join(f"{s} {len(v):,}" for s, v in by.items()))
++(DATA / "truth").mkdir(parents=True, exist_ok=True)
++with open(DATA / "truth" / "personas.csv", "w", newline="", encoding="utf-8") as fh:
++    w = csv.DictWriter(fh, fieldnames=["customer_id", "persona"])
++    w.writeheader()
++    w.writerows(truth)
++print(f"{len(rows):,} events of {N_CUSTOMERS:,} customers ({len(rows) / N_CUSTOMERS:.0f} each) -> {BRONZE}: "
++      + ", ".join(f"{s} {len(v):,}" for s, v in by.items()))
+diff pipelines/04_train.py
+--- a/pipelines/04_train.py
++++ b/pipelines/04_train.py
+@@ -3,13 +3,13 @@
+ PRAGMA's pretraining (pragmaLib/pretrain.py): masked modelling. The model reads every train customer's tokens with
+ some of them hidden (15% of tokens, 10% of whole events, 10% of a field across the history) and learns to guess them
+ back; no labels. Every --eval-every steps it pauses: the downstream probes of pipeline 5 are fit on its current
+-embeddings (on 4 snapshot dates, for speed) and their AUC on test customers is logged next to the loss.
++embeddings (a sample of customers on 2 snapshot dates, for speed) and their AUC on test customers is logged.
+ 
+ Reads  data/gold/tokens/train.pkl + data/gold/tokenizer.json (pipeline 3); data/silver/ for the downstream probes
+-Writes models/foundation/   model.pt (weights + size), tokenizer.json, metrics.jsonl (loss, accuracy, downstream AUC)
+-       reports/training_progress.png   loss and downstream AUC against pretraining step
++Writes models/<name>/   model.pt (weights + size), tokenizer.json, metrics.jsonl (loss, accuracy, downstream AUC)
++       reports/training_progress[_<name>].png   loss and downstream AUC against pretraining step
+ 
+-Run:  python pipelines/04_train.py [--steps 600] [--size nano] [--eval-every 100]
++Run:  python pipelines/04_train.py [--steps 600] [--size nano] [--eval-every 100] [--name foundation]
+       nano: minutes on a laptop CPU; small / medium / large are PRAGMA-S / M / L (10M / 100M / 1B): use a GPU
+ """
+ import argparse
+@@ -29,6 +29,7 @@
+ p.add_argument("--size", default="nano", choices=list(SIZES))
+ p.add_argument("--token-budget", type=int, default=8192, help="tokens per batch")
+ p.add_argument("--eval-every", type=int, default=100, help="steps between downstream evaluations; 0 = only at the end")
++p.add_argument("--name", default="foundation", help="run name: models/<name>")
+ a = p.parse_args()
+ if not (GOLD / "tokens" / "train.pkl").exists():
+     raise SystemExit("no tokens yet: run pipelines/03_gold.py first")
+@@ -36,13 +37,13 @@
+     items = pickle.load(fh)
+ tok = Tokenizer.load(GOLD / "tokenizer.json")
+ evaluate, baseline = evaluator(tok)
+-print("counts baseline, AUC on test customers: " + ", ".join(f"{t} {v:.3f}" for t, v in baseline.items()))
+-run = MODELS / "foundation"
++print("counts baseline, AUC on test customers: " + ", ".join(f"{t} {v:.3f}" for t, v in baseline.items()), flush=True)
++run = MODELS / a.name
+ shutil.rmtree(run, ignore_errors=True)  # a fresh run, not a resumed one
+ pretrain(items, len(tok.vocab), run, size=a.size, steps=a.steps, token_budget=a.token_budget, evaluate=evaluate, eval_every=a.eval_every)
+ shutil.copy(GOLD / "tokenizer.json", run / "tokenizer.json")  # the model is only valid with its own vocabulary
+ REPORTS.mkdir(exist_ok=True)
+-plot_progress(run / "metrics.jsonl", baseline, REPORTS / "training_progress.png", f"Pretraining {a.size}: masked modelling and downstream probes")
++png = REPORTS / ("training_progress.png" if a.name == "foundation" else f"training_progress_{a.name}.png")
++plot_progress(run / "metrics.jsonl", baseline, png, f"Pretraining {a.name} ({a.size}): masked modelling and downstream probes")
+ last = [json.loads(line) for line in (run / "metrics.jsonl").read_text(encoding="utf-8").splitlines()][-1]
+-print(f"trained {a.size} for {a.steps} steps -> {run}; hidden tokens guessed right {last['mlm_acc']:.0%}; "
+-      f"plot -> {REPORTS / 'training_progress.png'}")
++print(f"trained {a.size} for {a.steps} steps -> {run}; hidden tokens guessed right {last['mlm_acc']:.0%}; plot -> {png}")
+diff pipelines/05_downstream.py
+--- a/pipelines/05_downstream.py
++++ b/pipelines/05_downstream.py
+@@ -1,53 +1,77 @@
+-"""Pipeline 5 · Downstream tasks: logistic regression on the foundation model's embeddings.
++"""Pipeline 5 · Downstream tasks: logistic regression on the foundation model's embeddings, with significance.
+ 
+ As PRAGMA evaluates its embeddings: freeze the model, embed customers, fit a small model per task. Every customer
+ is looked at on 8 snapshot dates, two weeks apart; the history before the date goes through the frozen foundation
+-model (one embedding, with the profile), and each task asks what happens in the 7 days after it: will they convert,
+-open an email, click a banner, ... One logistic regression per task, fit on the train customers of pipeline 3,
+-scored on the test customers, next to a baseline that knows only counts (pipelines/downstream.py), and both
+-together, as when embeddings are added to existing propensity models.
++model, and each task asks what happens in the 7 days after it (pipelines/downstream.py). Three inputs per task:
++the counts baseline, the embedding, and both together, as when embeddings are added to existing propensity models.
++Uplift = AUC(counts + embedding) - AUC(counts), and AUC(embedding) - AUC(counts), with a 95% interval from
++resampling test customers; significant = Holm-adjusted p below 0.05 across the tasks.
+ 
+-Reads  models/foundation/ (pipeline 4), data/silver/ (pipeline 2), data/gold/split.json (pipeline 3)
+-Writes reports/downstream.md + downstream.json
++Reads  models/<name>/ (pipeline 4), data/silver/ (pipeline 2), data/gold/split.json (pipeline 3)
++Writes reports/downstream[_<name>].md + .json
+ 
+-Run:  python pipelines/05_downstream.py
++Run:  python pipelines/05_downstream.py [--name foundation] [--dates 8] [--boot 1000]
+ """
++import argparse
+ import json
+ 
+ import numpy as np
+ from common import MODELS, REPORTS
+-from downstream import EVERY_DAYS, HORIZON_DAYS, TASKS, probe, snapshots
++from downstream import EVERY_DAYS, HORIZON_DAYS, TASKS, holm, probe, snapshots, uplift
+ 
+ from pragmaLib.model import embed, load
+ 
+-if not (MODELS / "foundation" / "model.pt").exists():
+-    raise SystemExit("no foundation model yet: run pipelines/04_train.py first")
+-model, tok = load(MODELS / "foundation")
+-s = snapshots(8)
++p = argparse.ArgumentParser()
++p.add_argument("--name", default="foundation")
++p.add_argument("--dates", type=int, default=8)
++p.add_argument("--boot", type=int, default=1000, help="bootstrap resamples of test customers")
++a = p.parse_args()
++if not (MODELS / a.name / "model.pt").exists():
++    raise SystemExit(f"no model models/{a.name} yet: run pipelines/04_train.py first")
++model, tok = load(MODELS / a.name)
++s = snapshots(a.dates)
+ te, Y = s["te"], s["Y"]
+-print(f"{len(te):,} snapshots ({te.sum():,} of test customers); embedding them ...")
++print(f"{len(te):,} snapshots of {len(set(s['group'])):,} customers ({te.sum():,} of test customers); embedding them ...", flush=True)
+ E = embed(model, tok, s["records"])
+-res = {name: probe(X, Y, te) for name, X in {"counts": s["base"], "embedding": E, "counts + embedding": np.hstack([s["base"], E])}.items()}
++inputs = {"counts": s["base"], "embedding": E, "counts + embedding": np.hstack([s["base"], E])}
++res = {name: probe(X, Y, te, keep_predictions=True) for name, X in inputs.items()}
++tests = {}
++for task in TASKS:
++    if res["counts"][task]:
++        rows, y = res["counts"][task]["rows"], Y[res["counts"][task]["rows"], list(TASKS).index(task)]
++        for other in ("counts + embedding", "embedding"):
++            tests[(task, other)] = uplift(y, res[other][task]["p"], res["counts"][task]["p"], s["group"][rows], a.boot)
++adj = holm({k: v[3] for k, v in tests.items()})
+ 
+ results = []
+-for j, (task, event) in enumerate(TASKS.items()):
+-    r = {"task": task, "event": event, "rate": round(float(Y[te, j].mean()), 4), "positives_test": int(Y[te, j].sum())}
+-    results.append({**r, **{n: res[n][task] for n in res}} if res["counts"][task] else {**r, "skipped": "too few positives"})
++for task in TASKS:
++    r = res["counts"][task]
++    if not r:
++        results.append({"task": task, "skipped": "too few positives"})
++        continue
++    row = {"task": task, "n": r["n"], "positives": r["positives"], **{n: {m: res[n][task][m] for m in ("auc", "ap")} for n in inputs}}
++    for other in ("counts + embedding", "embedding"):
++        d, lo, hi, pv = tests[(task, other)]
++        row[f"uplift {other}"] = {"auc": round(d, 4), "low": round(lo, 4), "high": round(hi, 4), "p": round(pv, 4), "p_holm": round(adj[(task, other)], 4),
++                                  "significant": adj[(task, other)] < 0.05 and lo > 0}
++    results.append(row)
++suffix = "" if a.name == "foundation" else f"_{a.name}"
+ REPORTS.mkdir(exist_ok=True)
+-(REPORTS / "downstream.json").write_text(json.dumps({"horizon_days": HORIZON_DAYS, "snapshots": 8, "every_days": EVERY_DAYS,
+-                                                     "rows": len(te), "test_rows": int(te.sum()), "tasks": results}, indent=2), encoding="utf-8")
+-lines = [f"# Downstream tasks: what happens in the {HORIZON_DAYS} days after a snapshot", "",
+-         f"Logistic regression per task, fit on {int((~te).sum()):,} snapshots of train customers, scored on {int(te.sum()):,} snapshots "
+-         f"of test customers (8 snapshot dates, {EVERY_DAYS} days apart). ROC-AUC: 0.5 is a coin flip, 1 is perfect. "
+-         "Average precision (AP): compare it with the base rate. Gain: AUC of the embedding over the counts baseline.", "",
+-         "| Task | Base rate | AUC counts | AUC embedding | AUC counts + embedding | AP counts | AP embedding | AP counts + embedding | Gain |",
+-         "|---|---|---|---|---|---|---|---|---|"]
++(REPORTS / f"downstream{suffix}.json").write_text(json.dumps({"model": a.name, "horizon_days": HORIZON_DAYS, "dates": a.dates, "every_days": EVERY_DAYS,
++                                                              "rows": len(te), "test_rows": int(te.sum()), "tasks": results}, indent=2), encoding="utf-8")
++sig = lambda u: f"{u['auc']:+.3f} [{u['low']:+.3f}, {u['high']:+.3f}]{' **significant**' if u['significant'] else ''}"  # noqa: E731
++lines = [f"# Downstream tasks ({a.name}): what happens in the {HORIZON_DAYS} days after a snapshot", "",
++         f"Logistic regression per task, fit on {int((~te).sum()):,} snapshots of train customers, scored on {int(te.sum()):,} snapshots of "
++         f"test customers ({a.dates} snapshot dates, {EVERY_DAYS} days apart). ROC-AUC: 0.5 is a coin flip. Uplift: AUC difference with a 95% "
++         f"interval from {a.boot} resamples of test customers; significant = Holm-adjusted p < 0.05 over all {len(tests)} comparisons.", "",
++         "| Task | Test rows (positives) | AUC counts | AUC embedding | AUC counts + embedding | Uplift: + embedding | Uplift: embedding alone |",
++         "|---|---|---|---|---|---|---|"]
+ for r in results:
+     if "skipped" in r:
+-        lines.append(f"| {r['task']} | {r['rate']:.1%} | {r['skipped']} ({r['positives_test']} in test) | | | | | | |")
++        lines.append(f"| {r['task']} | {r['skipped']} | | | | | |")
+         continue
+-    c, e, b = r["counts"], r["embedding"], r["counts + embedding"]
+-    lines.append(f"| {r['task']} | {r['rate']:.1%} | {c['auc']:.3f} | {e['auc']:.3f} | {b['auc']:.3f} | {c['ap']:.3f} | {e['ap']:.3f} | {b['ap']:.3f} | {e['auc'] / c['auc'] - 1:+.1%} |")
+-(REPORTS / "downstream.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
++    lines.append(f"| {r['task']} | {r['n']:,} ({r['positives']:,}) | {r['counts']['auc']:.3f} | {r['embedding']['auc']:.3f} | {r['counts + embedding']['auc']:.3f} "
++                 f"| {sig(r['uplift counts + embedding'])} | {sig(r['uplift embedding'])} |")
++(REPORTS / f"downstream{suffix}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+ print("\n".join(lines[6:]))
+-print(f"-> {REPORTS / 'downstream.md'}")
++print(f"-> {REPORTS / f'downstream{suffix}.md'}")
+diff pipelines/06_finetune.py
+--- /dev/null
++++ b/pipelines/06_finetune.py
+@@ -0,0 +1,91 @@
++"""Pipeline 6 · LoRA fine-tuning per task: PRAGMA's main way to learn a downstream task (§3.1.2, Table 2).
++
++For each task (pipelines/downstream.py) the pretrained model of pipeline 4 gets LoRA adapters (rank 8, α 8, on QKV
++and the feed-forward layers; pragmaLib/lora.py) and a classification head, fine-tuned on the train customers'
++snapshots and scored on the test customers'. References, as in the paper: the probes on the frozen embedding
++(pipeline 5), and the counts baseline. Uplift = AUC(LoRA) - AUC(counts), and AUC(LoRA) - AUC(counts + embedding
++probe), with a 95% interval from resampling test customers; significant = Holm-adjusted p < 0.05 over all comparisons.
++
++Reads  models/<name>/ (pipeline 4), data/silver/ (pipeline 2), data/gold/split.json (pipeline 3)
++Writes reports/finetune_<name>.md + .json
++
++Run:  python pipelines/06_finetune.py [--name small] [--epochs 2] [--dates 4] [--tasks "opens the push it gets" ...]
++"""
++import argparse
++import json
++import time
++
++import numpy as np
++from common import MODELS, REPORTS
++from downstream import TASKS, holm, probe, snapshots, uplift
++from sklearn.metrics import roc_auc_score
++
++from pragmaLib.lora import finetune
++from pragmaLib.model import embed, load
++
++p = argparse.ArgumentParser()
++p.add_argument("--name", default="small")
++p.add_argument("--epochs", type=int, default=2)
++p.add_argument("--lr", type=float, default=1e-3)
++p.add_argument("--dates", type=int, default=4)
++p.add_argument("--boot", type=int, default=1000)
++p.add_argument("--tasks", nargs="*", default=list(TASKS))
++p.add_argument("--train-customers", type=int, default=None, help="a sample, for a quick test")
++p.add_argument("--test-customers", type=int, default=None)
++a = p.parse_args()
++model, tok = load(MODELS / a.name)
++s = snapshots(a.dates, a.train_customers, a.test_customers)
++te, Y = s["te"], s["Y"]
++items = [tok.encode(*r) for r in s["records"]]
++print(f"{len(items):,} snapshots ({te.sum():,} of test customers), model {a.name}", flush=True)
++E = embed(model, tok, s["records"])
++probes = {n: probe(X, Y, te, keep_predictions=True) for n, X in {"counts": s["base"], "embedding": E, "counts + embedding": np.hstack([s["base"], E])}.items()}
++
++results, tests = {}, {}
++for task in a.tasks:
++    j, ref = list(TASKS).index(task), probes["counts"][task]
++    if ref is None:
++        results[task] = {"skipped": "too few positives"}
++        continue
++    ok = Y[:, j] >= 0
++    tr, ts = np.flatnonzero(ok & ~te), ref["rows"]
++    t0 = time.time()
++    print(f"{task}: fine-tuning on {len(tr):,} train snapshots ({int(Y[tr, j].sum()):,} positives)", flush=True)
++    m, _ = load(MODELS / a.name)  # a fresh copy of the pretrained model per task
++    pl = finetune(m, [items[i] for i in tr], Y[tr, j], [items[i] for i in ts], epochs=a.epochs, lr=a.lr)
++    y = Y[ts, j]
++    pred = REPORTS / f"predictions_{a.name}"  # every method's test predictions, per task, for pipeline 7's KPIs
++    pred.mkdir(parents=True, exist_ok=True)
++    np.savez(pred / f"{task}.npz", y=y, group=s["group"][ts], LoRA=pl,
++             **{f"probe {n}": probes[n][task]["p"] for n in probes})
++    for other in ("counts", "counts + embedding"):
++        tests[(task, other)] = uplift(y, pl, probes[other][task]["p"], s["group"][ts], a.boot)
++    results[task] = {"n": len(ts), "positives": int(y.sum()), "seconds": round(time.time() - t0),
++                     "auc": {"LoRA": round(float(roc_auc_score(y, pl)), 4),
++                             **{n: probes[n][task]["auc"] for n in probes}}}
++    print(f"  AUC LoRA {results[task]['auc']['LoRA']:.3f} | counts {ref['auc']:.3f} | embedding probe {probes['embedding'][task]['auc']:.3f}"
++          f" | counts + embedding probe {probes['counts + embedding'][task]['auc']:.3f}  ({results[task]['seconds']} s)", flush=True)
++adj = holm({k: v[3] for k, v in tests.items()})
++for (task, other), (d, lo, hi, pv) in tests.items():
++    results[task][f"uplift over {other}"] = {"auc": round(d, 4), "low": round(lo, 4), "high": round(hi, 4), "p": round(pv, 4),
++                                             "p_holm": round(adj[(task, other)], 4), "significant": adj[(task, other)] < 0.05 and lo > 0}
++REPORTS.mkdir(exist_ok=True)
++(REPORTS / f"finetune_{a.name}.json").write_text(json.dumps({"model": a.name, "epochs": a.epochs, "lr": a.lr, "dates": a.dates, "tasks": results}, indent=2),
++                                                 encoding="utf-8")
++sig = lambda u: f"{u['auc']:+.3f} [{u['low']:+.3f}, {u['high']:+.3f}]{' **significant**' if u['significant'] else ''}"  # noqa: E731
++lines = [f"# LoRA fine-tuning per task ({a.name}), against the probes and the counts baseline", "",
++         f"LoRA rank 8, α 8 on QKV and feed-forward layers, plus a head on the customer embedding; Adam, lr {a.lr}, {a.epochs} epochs on the "
++         f"train customers' snapshots ({a.dates} snapshot dates, 7-day horizon), scored on the test customers'. Uplift: AUC difference with a "
++         f"95% interval from {a.boot} resamples of test customers; significant = Holm-adjusted p < 0.05 over all {len(tests)} comparisons.", "",
++         "| Task | Test rows (positives) | AUC LoRA | AUC counts | AUC embedding probe | AUC counts + embedding probe | LoRA − counts | LoRA − (counts + embedding) |",
++         "|---|---|---|---|---|---|---|---|"]
++for task, r in results.items():
++    if "skipped" in r:
++        lines.append(f"| {task} | {r['skipped']} | | | | | | |")
++        continue
++    au = r["auc"]
++    lines.append(f"| {task} | {r['n']:,} ({r['positives']:,}) | {au['LoRA']:.3f} | {au['counts']:.3f} | {au['embedding']:.3f} | {au['counts + embedding']:.3f} "
++                 f"| {sig(r['uplift over counts'])} | {sig(r['uplift over counts + embedding'])} |")
++(REPORTS / f"finetune_{a.name}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
++print("\n".join(lines[6:]))
++print(f"-> {REPORTS / f'finetune_{a.name}.md'}")
+diff pipelines/07_compare.py
+--- /dev/null
++++ b/pipelines/07_compare.py
+@@ -0,0 +1,117 @@
++"""Pipeline 7 · Compare every method on every downstream task, on many KPIs.
++
++Reads reports/predictions_<name>/<task>.npz (pipeline 6): per test snapshot of a task, the truth and each method's
++predicted probability: LoRA fine-tuning, and the logistic-regression probes on counts, embedding, counts + embedding.
++  ROC-AUC          ranking: a random positive above a random negative (0.5 = coin flip)
++  PR-AUC           average precision: ranking where it matters for rare events (compare with the base rate)
++  log-loss, Brier  are the probabilities right, not only their order (lower is better)
++  precision@10%    contact the 10% highest scored: the share of them who do it (hit rate)
++  recall@10%       ... the share of everyone who does it that was contacted
++  lift@10%         precision@10% / base rate: times better than contacting at random
++  F1@10%           balance of precision and recall at that budget
++  best F1          F1 at its best threshold (optimistic: the threshold is picked on test)
++Every KPI's difference with the counts baseline gets a 95% interval from resampling test customers (their snapshots
++stay together); marked when the interval excludes zero in the better direction.
++
++Writes reports/compare_<name>.md + .json, reports/gains_<name>.png (cumulative gains per task)
++
++Run:  python pipelines/07_compare.py [--name small] [--boot 500] [--budget 0.1]
++"""
++import argparse
++import json
++
++import numpy as np
++from common import REPORTS
++from sklearn.metrics import average_precision_score, brier_score_loss, log_loss, precision_recall_curve, roc_auc_score
++
++p = argparse.ArgumentParser()
++p.add_argument("--name", default="small")
++p.add_argument("--boot", type=int, default=500)
++p.add_argument("--budget", type=float, default=0.1, help="share of snapshots contacted for the @ KPIs")
++a = p.parse_args()
++B = f"{a.budget:.0%}"
++HIGHER = {"ROC-AUC": True, "PR-AUC": True, "log-loss": False, "Brier": False, f"precision@{B}": True, f"recall@{B}": True,
++          f"lift@{B}": True, f"F1@{B}": True, "best F1": True}
++METHODS = {"probe counts": "counts (baseline)", "probe embedding": "embedding probe", "probe counts + embedding": "counts + embedding probe",
++           "LoRA": "LoRA fine-tuned"}
++
++
++def kpis(y, p):
++    k = max(1, int(round(len(p) * a.budget)))
++    hits = y[np.argsort(-p, kind="stable")[:k]].sum()
++    prec, rec = hits / k, hits / max(1, y.sum())
++    pr, rc, _ = precision_recall_curve(y, p)
++    return dict(zip(HIGHER, [roc_auc_score(y, p), average_precision_score(y, p), log_loss(y, np.clip(p, 1e-6, 1 - 1e-6), labels=[0, 1]),
++                             brier_score_loss(y, p), prec, rec, prec / max(y.mean(), 1e-12), 2 * prec * rec / (prec + rec) if hits else 0.0,
++                             float(np.max(2 * pr * rc / np.maximum(pr + rc, 1e-12)))]))
++
++
++files = sorted((REPORTS / f"predictions_{a.name}").glob("*.npz"))
++if not files:
++    raise SystemExit(f"no predictions in reports/predictions_{a.name}: run pipelines/06_finetune.py --name {a.name} first")
++rng, out, lines = np.random.default_rng(0), {}, [f"# All KPIs per downstream task ({a.name}): counts baseline, probes and LoRA", "",
++                                                  f"Test snapshots of test customers. In brackets: the difference with the counts baseline and its 95% interval "
++                                                  f"from {a.boot} resamples of test customers; **better** = better beyond chance. @{B}: contact the {B} highest-scored "
++                                                  "snapshots. Lower is better for log-loss and Brier.", ""]
++for f in files:
++    d, task = np.load(f), f.stem
++    y, groups = d["y"].astype(int), d["group"]
++    preds = {m: d[m] for m in METHODS if m in d.files}
++    point = {m: kpis(y, pm) for m, pm in preds.items()}
++    rows_of = [np.flatnonzero(groups == g) for g in np.unique(groups)]
++    diffs = {m: {k: [] for k in HIGHER} for m in preds if m != "probe counts"}
++    for _ in range(a.boot):
++        idx = np.concatenate([rows_of[i] for i in rng.integers(0, len(rows_of), len(rows_of))])
++        if y[idx].min() == y[idx].max():
++            continue
++        base = kpis(y[idx], preds["probe counts"][idx])
++        for m in diffs:
++            for k, v in kpis(y[idx], preds[m][idx]).items():
++                diffs[m][k].append(v - base[k])
++    out[task] = {"n": len(y), "positives": int(y.sum()), "base_rate": round(float(y.mean()), 4), "methods": {}}
++    lines += [f"## {task}", "", f"{len(y):,} test snapshots, {int(y.sum()):,} positives (base rate {y.mean():.1%}).", "",
++              "| KPI | " + " | ".join(METHODS[m] for m in preds) + " |", "|---" * (len(preds) + 1) + "|"]
++    for m in preds:
++        out[task]["methods"][METHODS[m]] = {k: round(float(v), 4) for k, v in point[m].items()}
++    for k, higher in HIGHER.items():
++        cells = []
++        for m in preds:
++            v = point[m][k]
++            if m == "probe counts":
++                cells.append(f"{v:.3f}")
++                continue
++            lo, hi = np.percentile(diffs[m][k], [2.5, 97.5])
++            better = lo > 0 if higher else hi < 0
++            out[task]["methods"][METHODS[m]][f"{k} vs counts"] = {"diff": round(float(v - point['probe counts'][k]), 4), "low": round(float(lo), 4),
++                                                                   "high": round(float(hi), 4), "better": bool(better)}
++            cells.append(f"{v:.3f} ({v - point['probe counts'][k]:+.3f} [{lo:+.3f}, {hi:+.3f}]){' **better**' if better else ''}")
++        lines.append(f"| {k} | " + " | ".join(cells) + " |")
++    lines.append("")
++
++(REPORTS / f"compare_{a.name}.json").write_text(json.dumps(out, indent=2), encoding="utf-8")
++(REPORTS / f"compare_{a.name}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
++
++import matplotlib  # noqa: E402
++
++matplotlib.use("Agg")
++import matplotlib.pyplot as plt  # noqa: E402
++
++cols = min(3, len(files))
++fig, axes = plt.subplots((len(files) + cols - 1) // cols, cols, figsize=(5 * cols, 4.2 * ((len(files) + cols - 1) // cols)), squeeze=False)
++for ax, f in zip(axes.flat, files):
++    d = np.load(f)
++    y = d["y"].astype(int)
++    for i, m in enumerate(mm for mm in METHODS if mm in d.files):
++        order = np.argsort(-d[m], kind="stable")
++        ax.plot(np.arange(1, len(y) + 1) / len(y), np.cumsum(y[order]) / max(1, y.sum()), color=f"C{i}", label=METHODS[m])
++    ax.plot([0, 1], [0, 1], color="grey", linestyle="--", linewidth=0.8, label="random")
++    ax.axvline(a.budget, color="black", linewidth=0.6)
++    ax.set_title(f.stem, fontsize=10), ax.set_xlabel("share contacted (highest scores first)"), ax.set_ylabel("share of positives reached")
++    ax.legend(fontsize=7, loc="lower right")
++for ax in list(axes.flat)[len(files):]:
++    ax.axis("off")
++fig.suptitle(f"Cumulative gains per task ({a.name}): reaching the most positives with the fewest contacts")
++fig.tight_layout()
++fig.savefig(REPORTS / f"gains_{a.name}.png", dpi=110)
++print("\n".join(lines))
++print(f"-> {REPORTS / f'compare_{a.name}.md'}, {REPORTS / f'gains_{a.name}.png'}")
+diff pipelines/downstream.py
+--- a/pipelines/downstream.py
++++ b/pipelines/downstream.py
+@@ -1,9 +1,11 @@
+ """Downstream tasks, shared by pipeline 4 (during training), pipeline 5 (the report) and experiments/.
+ 
+-A snapshot is a customer's history before a date; each task asks what happens in the 7 days after it. One logistic
+-regression per task on standard-scaled inputs, as PRAGMA probes its embeddings (§3.1.1): fit on train customers,
+-scored (ROC-AUC, average precision) on test customers. The counts baseline knows each event type's count in the
+-history and in the last 30 days, the days since the last event, and the profile's numbers.
++A snapshot is a customer's history before a date; each task asks what happens in the 7 days after it. Contact tasks
++are conditional, as PRAGMA's engagement task: "opens the email it gets" only counts snapshots where an email arrives
++in those 7 days. One logistic regression per task on standard-scaled inputs, as PRAGMA probes its embeddings
++(§3.1.1): fit on train customers, scored (ROC-AUC, average precision) on test customers. The counts baseline knows
++each event type's count in the history and in the last 30 days, the days since the last event, and the profile's
++numbers. uplift() says whether one input beats another beyond chance, resampling whole test customers.
+ """
+ import json
+ 
+@@ -15,53 +17,90 @@
+ from sklearn.preprocessing import StandardScaler
+ 
+ HORIZON_DAYS, EVERY_DAYS = 7, 14
+-TASKS = {"converts (contract signed)": "contract_signed", "applies for a product": "application", "opens an email": "email_opened",
+-         "opens a push message": "push_opened", "clicks a banner": "banner_clicked", "answers a call": "call_answered",
+-         "visits a page": "page_visited", "unsubscribes": "unsubscribed", "terminates a contract": "contract_terminated"}
++TASKS = {  # name: (event that must happen in the 7 days for the snapshot to count, or None; the event to predict)
++    "converts (contract signed)": (None, "contract_signed"), "applies for a product": (None, "application"),
++    "visits the app": (None, "page_visited"), "terminates a contract": (None, "contract_terminated"),
++    "opens the email it gets": ("email_sent", "email_opened"), "opens the push it gets": ("push_sent", "push_opened"),
++    "answers the call it gets": ("call_made", "call_answered"), "clicks the banner it sees": ("banner_shown", "banner_clicked"),
++    "unsubscribes after an email": ("email_sent", "unsubscribed")}
+ PROFILE_NUMBERS = ("age", "monthly_income", "customer_since_years")
+ 
+ 
+-def snapshots(n_dates=8):
+-    """Every customer on n_dates snapshot dates, two weeks apart, ending a week before the data does.
+-    -> {records: [(profile, history, None)], base: counts features, Y: [rows, tasks] bool, te: is a test customer}"""
+-    test_ids = set(json.loads((GOLD / "split.json").read_text(encoding="utf-8"))["test"])
+-    customers = {p.stem: read_silver(p) for p in sorted(SILVER.glob("*.txt"))}
++def snapshots(n_dates=8, n_train=None, n_test=None, seed=0):
++    """Customers on n_dates snapshot dates, two weeks apart, ending a week before the data does; at most n_train /
++    n_test customers of each split (a seeded sample). -> {records: [(profile, history, None)], base: counts features,
++    Y: [rows, tasks] 1 / 0 / -1 (does not apply), te: is a test customer, group: customer number}"""
++    split, rng = json.loads((GOLD / "split.json").read_text(encoding="utf-8")), np.random.default_rng(seed)
++    pick = lambda ids, n: ids if n is None or n >= len(ids) else sorted(rng.choice(ids, n, replace=False).tolist())  # noqa: E731
++    ids = [(c, False) for c in pick(split["train"], n_train)] + [(c, True) for c in pick(split["test"], n_test)]
++    customers = {c: read_silver(SILVER / f"{c}.txt") for c, _ in ids}
+     names = sorted({f["event"] for _, evs in customers.values() for _, _, f in evs})
+     end, h = max(evs[-1][0] for _, evs in customers.values() if evs), HORIZON_DAYS * DAY_US
+-    records, base, labels, is_test = [], [], [], []
+-    for cid, (attrs, evs) in customers.items():
++    records, base, labels, is_test, group = [], [], [], [], []
++    for g, (cid, test) in enumerate(ids):
++        attrs, evs = customers[cid]
++        times = np.array([e[0] for e in evs], dtype=np.int64)
+         for t in (end - h - k * EVERY_DAYS * DAY_US for k in range(n_dates)):
+-            hist = [e for e in evs if e[0] < t]
+-            if not hist:
++            k = int(np.searchsorted(times, t))
++            if not k:
+                 continue
+-            coming = {f["event"] for ts, _, f in evs if t <= ts < t + h}
++            hist = evs[:k]
++            coming = {f["event"] for ts, _, f in evs[k:] if ts < t + h}
+             every, recent = [f["event"] for _, _, f in hist], [f["event"] for ts, _, f in hist if ts >= t - 30 * DAY_US]
+             records.append((attrs, hist, None))  # times count back from the latest event before the snapshot, as in pretraining
+             base.append([*(every.count(n) for n in names), *(recent.count(n) for n in names), np.log1p((t - hist[-1][0]) / DAY_US),
+-                         len(hist), *(float(attrs.get(k, 0)) for k in PROFILE_NUMBERS)])
+-            labels.append([e in coming for e in TASKS.values()])
+-            is_test.append(cid in test_ids)
+-    return {"records": records, "base": np.array(base, dtype=float), "Y": np.array(labels), "te": np.array(is_test), "n_dates": n_dates}
++                         len(hist), *(float(attrs.get(k_, 0)) for k_ in PROFILE_NUMBERS)])
++            labels.append([-1 if cond and cond not in coming else int(ev in coming) for cond, ev in TASKS.values()])
++            is_test.append(test)
++            group.append(g)
++    return {"records": records, "base": np.array(base, dtype=float), "Y": np.array(labels, dtype=np.int8), "te": np.array(is_test),
++            "group": np.array(group), "n_dates": n_dates}
+ 
+ 
+-def probe(X, Y, te) -> dict:
+-    """-> {task: {"auc", "ap"} or None when too few positives (under 20 in train or 10 in test)}."""
++def probe(X, Y, te, keep_predictions=False) -> dict:
++    """-> {task: {"auc", "ap", "n", "positives"} (+ "rows", "p" on test) or None when under 20 positives in train or 10 in test}."""
+     out = {}
+     for j, task in enumerate(TASKS):
+-        y = Y[:, j]
+-        if y[~te].sum() < 20 or y[te].sum() < 10:
++        y, ok = Y[:, j], Y[:, j] >= 0
++        tr, ts = ok & ~te, ok & te
++        if y[tr].sum() < 20 or y[ts].sum() < 10:
+             out[task] = None
+             continue
+-        p = make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000)).fit(X[~te], y[~te]).predict_proba(X[te])[:, 1]
+-        out[task] = {"auc": round(float(roc_auc_score(y[te], p)), 3), "ap": round(float(average_precision_score(y[te], p)), 3)}
++        p = make_pipeline(StandardScaler(), LogisticRegression(max_iter=3000)).fit(X[tr], y[tr]).predict_proba(X[ts])[:, 1]
++        out[task] = {"auc": round(float(roc_auc_score(y[ts], p)), 4), "ap": round(float(average_precision_score(y[ts], p)), 4),
++                     "n": int(ts.sum()), "positives": int(y[ts].sum()), **({"rows": np.flatnonzero(ts), "p": p} if keep_predictions else {})}
+     return out
+ 
+ 
+-def evaluator(tok, n_dates=4):
+-    """For training: -> (evaluate(model) -> {task: AUC}, the counts baseline's {task: AUC}) on n_dates snapshot dates."""
++def uplift(y, pa, pb, groups, n_boot=1000, seed=0):
++    """AUC(pa) - AUC(pb) on the same test rows, with a 95% interval and a two-sided p-value from resampling whole
++    customers n_boot times (their snapshots stay together). -> (difference, low, high, p)"""
++    rng = np.random.default_rng(seed)
++    g, inv = np.unique(groups, return_inverse=True)
++    diffs = []
++    for _ in range(n_boot):
++        w = rng.multinomial(len(g), np.full(len(g), 1 / len(g)))[inv]  # how often each row's customer was drawn
++        if len(set(y[w > 0])) == 2:
++            diffs.append(roc_auc_score(y, pa, sample_weight=w) - roc_auc_score(y, pb, sample_weight=w))
++    d = np.array(diffs)
++    return (float(roc_auc_score(y, pa) - roc_auc_score(y, pb)), *map(float, np.percentile(d, [2.5, 97.5])),
++            float(min(1.0, 2 * min((d <= 0).mean(), (d >= 0).mean()))))
++
++
++def holm(ps: dict) -> dict:
++    """Holm-adjusted p-values: the chance of at least one false 'significant' stays under 5% across all tasks."""
++    order, out, run = sorted(ps, key=ps.get), {}, 0.0
++    for i, k in enumerate(order):
++        run = max(run, min(1.0, (len(order) - i) * ps[k]))
++        out[k] = run
++    return out
++
++
++def evaluator(tok, n_dates=2, n_train=3000, n_test=1500):
++    """For training: -> (evaluate(model) -> {task: AUC}, the counts baseline's {task: AUC}) on a sample of customers."""
+     from pragmaLib.model import embed
+ 
+-    s = snapshots(n_dates)
++    s = snapshots(n_dates, n_train, n_test)
+     baseline = {t: r["auc"] for t, r in probe(s["base"], s["Y"], s["te"]).items() if r}
+ 
+     def evaluate(model):
+diff pragmaLib/lora.py
+--- /dev/null
++++ b/pragmaLib/lora.py
+@@ -0,0 +1,73 @@
++"""LoRA fine-tuning per task, as PRAGMA adapts its foundation model (paper §3.1.2; LoRA: Hu et al. 2021).
++
++The pretrained weights stay frozen. In every block of the three encoders, the attention projection (QKV) and both
++feed-forward layers get a trainable low-rank update, W x + (α / r) · B A x, with rank r = 8 and α = 8 as in the
++paper; A starts random and B at zero, so fine-tuning starts exactly from the pretrained model. A classification head
++on the customer embedding (z_h at [USR]) is trained with them: Adam, binary cross-entropy, one model per task.
++"""
++import math
++
++import numpy as np
++import torch
++from torch import nn
++from torch.nn import functional as F
++
++from .model import collate, groups
++
++
++class LoRALinear(nn.Module):
++    def __init__(self, base: nn.Linear, r=8, alpha=8):
++        super().__init__()
++        self.base, self.scale = base, alpha / r
++        self.A = nn.Parameter(torch.empty(r, base.in_features))
++        self.B = nn.Parameter(torch.zeros(base.out_features, r))
++        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
++
++    def forward(self, x):
++        return self.base(x) + (x @ self.A.T.to(x.dtype)) @ self.B.T.to(x.dtype) * self.scale
++
++
++def add_lora(model, r=8, alpha=8) -> int:
++    """Freeze the model and put LoRA on QKV and the feed-forward layers of every encoder block. -> trainable weights."""
++    for p in model.parameters():
++        p.requires_grad_(False)
++    for enc in (model.event_enc, model.profile_enc, model.history_enc):
++        for blk in enc.blocks:
++            blk.qkv = LoRALinear(blk.qkv, r, alpha)
++            blk.ff[0], blk.ff[2] = LoRALinear(blk.ff[0], r, alpha), LoRALinear(blk.ff[2], r, alpha)
++    return sum(p.numel() for p in model.parameters() if p.requires_grad)
++
++
++def finetune(model, train, y, test, epochs=2, lr=1e-3, token_budget=32768, seed=0, log=print):
++    """train / test: Tokenizer.encode() outputs, y: 0 / 1 per train item. -> P(positive) per test item.
++    lr and epochs are not in the paper: GUESS, the usual LoRA range."""
++    torch.manual_seed(seed)
++    rng, dev = np.random.default_rng(seed), next(model.parameters()).device
++    n_lora = add_lora(model)
++    model.to(dev)
++    head = nn.Linear(model.dim, 1).to(dev)
++    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad] + list(head.parameters()), lr=lr)
++    yt, cuda = torch.tensor(np.asarray(y, np.float32), device=dev), dev.type == "cuda"
++    train_batches, test_batches = groups(train, token_budget), groups(test, token_budget)
++
++    def logits(items, idx):
++        with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=cuda):
++            return head(model(collate([items[i] for i in idx], dev))["user"]).float().squeeze(-1)
++
++    for ep in range(epochs):
++        model.train()
++        total = 0.0
++        for k in rng.permutation(len(train_batches)):
++            idx = train_batches[k]
++            loss = F.binary_cross_entropy_with_logits(logits(train, idx), yt[torch.as_tensor(idx, device=dev)])
++            opt.zero_grad(set_to_none=True)
++            loss.backward()
++            opt.step()
++            total += loss.item() * len(idx)
++        log(f"  epoch {ep + 1}/{epochs}: loss {total / len(train):.4f} ({n_lora:,} LoRA weights + the head)")
++    model.eval()
++    p = np.zeros(len(test), np.float32)
++    with torch.no_grad():
++        for idx in test_batches:
++            p[idx] = torch.sigmoid(logits(test, idx)).cpu().numpy()
++    return p
+diff pragmaLib/model.py
+--- a/pragmaLib/model.py
++++ b/pragmaLib/model.py
+@@ -65,7 +65,7 @@
+ 
+ 
+ class PragmaModel(nn.Module):
+-    def __init__(self, vocab_size, size="nano", dropout=0.1, init_std=None, emb_dropout=0.0, head="mlp"):
++    def __init__(self, vocab_size, size="nano", dropout=0.1, init_std=0.02, emb_dropout=0.1, head="linear"):
+         super().__init__()
+         d, ffn, dp, de, dh, heads = SIZES[size]
+         self.config = {"vocab_size": vocab_size, "size": size, "dropout": dropout, "init_std": init_std,
+@@ -121,10 +121,9 @@
+     for i, it in enumerate(items):
+         ne = len(it["time"])
+         keys[i, :ne, 0], ev_mask[i, :ne], time[i, :ne], cal[i, :ne] = EVT, True, it["time"], it["cal"]
+-        slot = np.zeros(ne, np.int64)
+-        for k, v, e in zip(it["keys"], it["vals"], it["evt"]):  # ponytail: a Python loop per token; vectorise if it shows up
+-            slot[e] += 1
+-            keys[i, e, slot[e]], vals[i, e, slot[e]] = k, v
++        e = it["evt"]  # tokens come grouped by event, in order: a token's slot is its rank within its event, after [EVT]
++        slot = np.arange(len(e)) - np.searchsorted(e, e) + 1
++        keys[i, e, slot], vals[i, e, slot] = it["keys"], it["vals"]
+         npf = len(it["pkeys"])
+         pk[i, 0], pk[i, 1:1 + npf], pv[i, 1:1 + npf], p_mask[i, :1 + npf] = USR, it["pkeys"], it["pvals"], True
+     tok_mask = keys != PAD
+@@ -133,16 +132,36 @@
+     return {k: torch.from_numpy(v).to(device) for k, v in t.items()}
+ 
+ 
++def groups(items, token_budget=65536):
++    """Index batches of Tokenizer.encode() outputs, shortest histories first, each up to token_budget padded slots
++    (rows x events x tokens), so short and long histories are not padded together."""
++    n_ev = np.array([max(1, len(it["time"])) for it in items])
++    n_tok = np.array([1 + (int(np.bincount(it["evt"]).max()) if len(it["evt"]) else 0) for it in items])  # widest event, + [EVT]
++    order, out, i = np.argsort(n_ev, kind="stable"), [], 0
++    while i < len(order):
++        j, e_max, t_max = i, 1, 1
++        while j < len(order):
++            e_max, t_max = max(e_max, n_ev[order[j]]), max(t_max, n_tok[order[j]])
++            if j > i and (j - i + 1) * e_max * t_max > token_budget:
++                break
++            j += 1
++        out.append(order[i:j])
++        i = j
++    return out
++
++
+ @torch.no_grad()
+-def embed(model, tokenizer, records, batch_size=128):
++def embed(model, tokenizer, records, token_budget=65536):
+     """records: [(profile attributes, events, evaluation point in µs or None)] -> [n, d] customer embeddings."""
+     model.eval()
+     device = next(model.parameters()).device
+-    out = []
+-    for i in range(0, len(records), batch_size):
+-        b = collate([tokenizer.encode(*r) for r in records[i:i + batch_size]], device)
+-        out.append(model(b)["user"].float().cpu().numpy())
+-    return np.vstack(out) if out else np.zeros((0, model.dim), np.float32)
++    items = [tokenizer.encode(*r) for r in records]
++    out = np.zeros((len(items), model.dim), np.float32)
++    for idx in groups(items, token_budget):
++        b = collate([items[k] for k in idx], device)
++        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
++            out[idx] = model(b)["user"].float().cpu().numpy()
++    return out
+ 
+ 
+ def load(run_dir):
+diff pragmaLib/pretrain.py
+--- a/pragmaLib/pretrain.py
++++ b/pragmaLib/pretrain.py
+@@ -35,23 +35,30 @@
+     return vals.masked_fill(scored, MASK).masked_fill(unk, UNK), scored, vals[scored]
+ 
+ 
+-def batches(items, token_budget, rng):
+-    """Shuffled customers, grouped until a batch holds token_budget tokens; forever."""
++def batches(items, token_budget, rng, pool=4096):
++    """Customers of similar length together (the paper groups its shards by event count), each batch filled up to
++    token_budget tokens, batches in random order; forever. Lengths are sorted within shuffled pools of customers."""
+     sizes = np.array([len(it["keys"]) + len(it["time"]) + len(it["pkeys"]) + 1 for it in items])
+     while True:
+-        batch, used = [], 0
+-        for i in rng.permutation(len(items)):
+-            if batch and used + sizes[i] > token_budget:
+-                yield batch
+-                batch, used = [], 0
+-            batch.append(items[i])
+-            used += sizes[i]
+-        if batch:
+-            yield batch
++        out = []
++        order = rng.permutation(len(items))
++        for start in range(0, len(order), pool):
++            chunk = order[start:start + pool]
++            batch, used = [], 0
++            for i in chunk[np.argsort(sizes[chunk], kind="stable")]:
++                if batch and used + sizes[i] > token_budget:
++                    out.append(batch)
++                    batch, used = [], 0
++                batch.append(items[i])
++                used += sizes[i]
++            if batch:
++                out.append(batch)
++        for k in rng.permutation(len(out)):
++            yield out[k]
+ 
+ 
+ def pretrain(items, vocab_size, run_dir: Path, size="nano", steps=600, token_budget=8192, seed=0,
+-             lr_muon=3e-3, lr_adamw=3e-4, weight_decay=0.01, warmup=None, log_every=10, model_args=None, optim="enc",
++             lr_muon=3e-3, lr_adamw=3e-4, weight_decay=0.01, warmup=None, log_every=10, model_args=None, optim="all",
+              evaluate=None, eval_every=0):
+     """items: Tokenizer.encode() outputs of the train customers. Writes run_dir/model.pt and metrics.jsonl.
+     optim: "enc" = Muon on the encoders' matrices only, AdamW (default betas) with weight decay on the rest;
